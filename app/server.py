@@ -104,59 +104,47 @@ Create learning activities and assessments aligned strictly with:
 
 Do NOT add or modify objectives. Always state which objective(s) each activity or assessment aligns with.
 
-TIME REQUIREMENT (MANDATORY)
-Allocate 60–70% of total duration to lecture (not available for activities).
-Use ONLY the remaining 20–30% for activities + assessments.
-Explicitly calculate and display:
-- Total duration
-- Lecture time
-- Remaining time
-The combined time for activities + assessments MUST NOT exceed the remaining time.
-If time is limited (<20 min), reduce the number and complexity of activities.
+TIME REQUIREMENT (STRICTLY ENFORCED)
+Step 1: Calculate total duration from the lesson info.
+Step 2: Lecture time = 65% of total duration (round to nearest minute).
+Step 3: Remaining time = total duration - lecture time.
+Step 4: Activities + assessments MUST use EXACTLY the remaining time. Not more, not less.
+Step 5: Distribute remaining time: 70% for activities, 30% for assessments (round to nearest minute).
 
-SECTION 1 — Learning Activities
-Create 2–4 varied activities.
-Each activity must:
-- Match learner level
-- Directly support one or more objectives
-- Use appropriate cybersecurity pedagogy (lab, log analysis, simulation, threat modeling, secure config, etc.)
-- Include clear student steps
-- Include a precise time estimate
+If remaining time is less than 15 minutes: create only 2 activities and 2 assessments.
+If remaining time is 15-25 minutes: create 3 activities and 3 assessments.
+If remaining time is more than 25 minutes: create 4 activities and 3 assessments.
 
-SECTION 2 — Assessments
-Create exactly 3 assessment items that:
-- Align with the objectives
-- Match learner level
-- Fit within remaining time
-- Use simple single-lesson formats (MCQ, short answer, scenario, mini task)
-- Include time estimates
+Each activity and assessment MUST have a time estimate. The sum of all times MUST equal the remaining time exactly.
 
-REQUIRED OUTPUT FORMAT:
+REQUIRED OUTPUT FORMAT (follow this order exactly):
 
 ### Time Allocation Calculation
-- Total Duration: … minutes
-- Lecture (60–70%): … minutes
-- Remaining for Activities + Assessments: … minutes
+- Total Duration: X minutes
+- Lecture (65%): X minutes
+- Remaining for Activities + Assessments: X minutes
+- Activities budget (70% of remaining): X minutes
+- Assessments budget (30% of remaining): X minutes
 
 ### Learning Activities
 
-1. Title
+1. [Title]
 - Aligned Objective(s): …
 - Description: …
 - Steps: …
-- Time Required: … minutes
+- Time Required: X minutes
 
-2. Title
+2. [Title]
 - Aligned Objective(s): …
 - Description: …
 - Steps: …
-- Time Required: … minutes
+- Time Required: X minutes
 
-3. Title (if time permits)
+3. [Title] (if time permits)
 - Aligned Objective(s): …
 - Description: …
 - Steps: …
-- Time Required: … minutes
+- Time Required: X minutes
 
 ### Assessments
 
@@ -164,24 +152,24 @@ REQUIRED OUTPUT FORMAT:
 - Aligned Objective(s): …
 - Format: …
 - Description: …
-- Time Required: … minutes
+- Time Required: X minutes
 
 2.
 - Aligned Objective(s): …
 - Format: …
 - Description: …
-- Time Required: … minutes
+- Time Required: X minutes
 
 3.
 - Aligned Objective(s): …
 - Format: …
 - Description: …
-- Time Required: … minutes
+- Time Required: X minutes
 
 ### Time Summary
-- Total Activity Time: … minutes
-- Total Assessment Time: … minutes
-- Grand Total: … minutes
+- Total Activity Time: X minutes
+- Total Assessment Time: X minutes
+- Grand Total: X minutes (MUST equal remaining time)
 
 After the time summary, end with exactly:
 ---
@@ -189,9 +177,9 @@ After the time summary, end with exactly:
 - Ask me to **regenerate** this lesson plan
 - Ask me to **modify** a specific section
 - Provide details for a **new lesson plan**""",
-    model="gpt-4.1",
+    model="o4-mini",
     tools=[web_search_preview],
-    model_settings=ModelSettings(temperature=1, top_p=1, max_tokens=2048, store=True)
+    model_settings=ModelSettings(max_tokens=4096, store=True)
 )
 
 get_data_agent = Agent(
@@ -232,13 +220,25 @@ Apply the requested change according to these strict rules:
 7. If Activities change → Regenerate activities only. Keep everything else.
 8. If Assessments change → Regenerate assessments only. Keep everything else.
 
-Always output the COMPLETE updated lesson plan in the same format including all sections.
-For activities and assessments, follow the time allocation rules:
-- Lecture: 60-70% of duration
-- Activities + Assessments: remaining 20-30%
-- Include Time Allocation Calculation and Time Summary sections.""",
-    model="gpt-4.1",
-    model_settings=ModelSettings(temperature=1, max_tokens=4096, store=True)
+IMPORTANT: Always output the COMPLETE updated lesson plan with ALL sections in this exact order:
+1. Lesson Information
+2. Learning Objectives
+3. Learning Theory
+4. Teaching Strategy
+5. Time Allocation Calculation
+6. Learning Activities
+7. Assessments
+8. Time Summary
+
+TIME RULES (STRICTLY ENFORCED):
+- Lecture = 65% of total duration
+- Remaining = total duration - lecture time
+- Activities budget = 70% of remaining
+- Assessments budget = 30% of remaining
+- Sum of all activity times MUST equal activities budget exactly
+- Sum of all assessment times MUST equal assessments budget exactly""",
+    model="o4-mini",
+    model_settings=ModelSettings(max_tokens=4096, store=True)
 )
 
 
