@@ -60,13 +60,13 @@ CASCADE_RULES: dict[str, dict] = {
         "assessments_only": False,
     },
     "objectives": {
-        "ft_sections": ["objectives", "teaching_strategy"],
+        "ft_sections": ["teaching_strategy"],
         "needs_activities": True,
         "activities_only": False,
         "assessments_only": False,
     },
     "learning_theory": {
-        "ft_sections": ["learning_theory", "teaching_strategy"],
+        "ft_sections": ["teaching_strategy"],
         "needs_activities": True,
         "activities_only": False,
         "assessments_only": False,
@@ -634,7 +634,8 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
                     "course_title": current_plan["course_title"],
                     "topic": current_plan["topic"],
                     "duration": current_plan["duration"],
-                    "learner_level": current_plan["learner_level"]
+                    "learner_level": current_plan["learner_level"],
+                    "instruction": f"The teacher wants to change: {changed_element}. Latest request: {items[-1].content if items else ''}"
                 })
                 ft_result = await Runner.run(ft_model_agent, ft_input)
                 ft_text = str(ft_result.final_output) if ft_result.final_output else ""
