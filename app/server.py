@@ -48,7 +48,7 @@ intent_agent = Agent(
     instructions="""You classify the teacher's LATEST message. Read the full conversation for context.
 
 INTENT OPTIONS:
-- "new_lesson": Teacher provides new lesson details or says they want a new/different lesson topic
+- "new_lesson": Teacher provides new lesson details or wants a lesson on a new topic
 - "regenerate": Teacher is unhappy with the CURRENT lesson and wants it redone with SAME details (e.g. "not good", "try again", "give me a different one", "regenerate", "redo this")
 - "modify": Teacher wants to change ONE specific section of the current lesson plan
 - "get_info": Not enough details provided yet
@@ -273,7 +273,7 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
         def append_context(base_input, text: str):
             return base_input + [{"role": "assistant", "content": text}]
 
-        # ── Detect intent ──
+        # Detect intent
         intent_result = await Runner.run(intent_agent, agent_input)
         intent_output = intent_result.final_output
         intent = intent_output.intent.strip().lower() if intent_output else "other"
@@ -292,18 +292,15 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
                     yield event
                 return
 
-            # 1. ft model — run once to get output, stream separately
             ft_out = str((await Runner.run(ft_full_generator, agent_input)).final_output or "")
             async for event in stream_agent_response(agent_context, Runner.run_streamed(ft_full_generator, agent_input)):
                 yield event
 
-            # 2. activities — pass ft output as context
             act_input = append_context(agent_input, ft_out)
             act_out = str((await Runner.run(activities_generator, act_input)).final_output or "")
             async for event in stream_agent_response(agent_context, Runner.run_streamed(activities_generator, act_input)):
                 yield event
 
-            # 3. assessments — pass ft + activities output as context
             assess_input = append_context(act_input, act_out)
             async for event in stream_agent_response(agent_context, Runner.run_streamed(assessments_generator, assess_input)):
                 yield event
@@ -382,5 +379,6 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
             else:
                 async for event in stream_agent_response(agent_context, Runner.run_streamed(general_agent, agent_input)):
                     yield event
+
 
 StarterChatServer = LessonPlannerServer
