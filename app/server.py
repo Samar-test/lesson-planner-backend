@@ -262,8 +262,6 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
         context: dict[str, Any],
     ) -> AsyncIterator[ThreadStreamEvent]:
 
-        from chatkit.types import AssistantMessageItem, TextContent
-
         items_page = await self.store.load_thread_items(
             thread.id, after=None, limit=MAX_RECENT_ITEMS,
             order="desc", context=context,
@@ -272,33 +270,17 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
         agent_input = await simple_to_agent_input(items)
         agent_context = AgentContext(thread=thread, store=self.store, request_context=context)
 
-        # ── Helper: run agent, stream output, return output text ──
-        async def run_and_stream(agent, input_data):
-            result = Runner.run_streamed(agent, input_data)
-            output_text = ""
-            async for event in stream_agent_response(agent_context, result):
-                yield event
-            # Get final output after streaming
-            final = await result.get_final_run_result() if hasattr(result, 'get_final_run_result') else None
-            if final and final.final_output:
-                output_text = str(final.final_output)
-            return output_text
-
-        # ── Helper: append assistant text to input ──
-        def append_to_input(base_input, text: str):
+        def append_context(base_input, text: str):
             return base_input + [{"role": "assistant", "content": text}]
 
-        # ── Step 1: Detect intent ──
+        # ── Detect intent ──
         intent_result = await Runner.run(intent_agent, agent_input)
         intent_output = intent_result.final_output
         intent = intent_output.intent.strip().lower() if intent_output else "other"
         changed_element = intent_output.changed_element.strip().lower() if intent_output else ""
 
-        # ── Step 2: Route ──
-
         if intent == "other":
-            result = Runner.run_streamed(general_agent, agent_input)
-            async for event in stream_agent_response(agent_context, result):
+            async for event in stream_agent_response(agent_context, Runner.run_streamed(general_agent, agent_input)):
                 yield event
             return
 
@@ -306,119 +288,99 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
             info_result = await Runner.run(info_collector_agent, agent_input)
             info = info_result.final_output
             if not info or not info.has_all_details:
-                result = Runner.run_streamed(get_data_agent, agent_input)
-                async for event in stream_agent_response(agent_context, result):
+                async for event in stream_agent_response(agent_context, Runner.run_streamed(get_data_agent, agent_input)):
                     yield event
                 return
 
-            # Run ft model (non-streamed), get output
-            ft_result = await Runner.run(ft_full_generator, agent_input)
-            ft_output = str(ft_result.final_output) if ft_result.final_output else ""
-            # Stream ft output as text
-            result = Runner.run_streamed(ft_full_generator, agent_input)
-            async for event in stream_agent_response(agent_context, result):
+            # 1. ft model — run once to get output, stream separately
+            ft_out = str((await Runner.run(ft_full_generator, agent_input)).final_output or "")
+            async for event in stream_agent_response(agent_context, Runner.run_streamed(ft_full_generator, agent_input)):
                 yield event
 
-            # Run activities (non-streamed) with ft output in context
-            act_input = append_to_input(agent_input, ft_output)
-            act_result = await Runner.run(activities_generator, act_input)
-            act_output = str(act_result.final_output) if act_result.final_output else ""
-            # Stream activities
-            result = Runner.run_streamed(activities_generator, act_input)
-            async for event in stream_agent_response(agent_context, result):
+            # 2. activities — pass ft output as context
+            act_input = append_context(agent_input, ft_out)
+            act_out = str((await Runner.run(activities_generator, act_input)).final_output or "")
+            async for event in stream_agent_response(agent_context, Runner.run_streamed(activities_generator, act_input)):
                 yield event
 
-            # Run assessments with ft + activities output in context
-            assess_input = append_to_input(act_input, act_output)
-            result = Runner.run_streamed(assessments_generator, assess_input)
-            async for event in stream_agent_response(agent_context, result):
+            # 3. assessments — pass ft + activities output as context
+            assess_input = append_context(act_input, act_out)
+            async for event in stream_agent_response(agent_context, Runner.run_streamed(assessments_generator, assess_input)):
                 yield event
             return
 
         if intent == "modify":
 
-            async def run_ft_stream_and_get(agent, input_data):
-                """Run agent non-streamed to get output, then stream it."""
-                r = await Runner.run(agent, input_data)
-                out = str(r.final_output) if r.final_output else ""
-                streamed = Runner.run_streamed(agent, input_data)
-                async for event in stream_agent_response(agent_context, streamed):
-                    yield event
-
-            async def activities_then_assessments(base_input, context_text=""):
-                """Run activities then assessments sequentially."""
-                act_in = append_to_input(base_input, context_text) if context_text else base_input
-                act_r = await Runner.run(activities_generator, act_in)
-                act_out = str(act_r.final_output) if act_r.final_output else ""
-                streamed = Runner.run_streamed(activities_generator, act_in)
-                async for event in stream_agent_response(agent_context, streamed):
-                    yield event
-
-                assess_in = append_to_input(act_in, act_out)
-                streamed2 = Runner.run_streamed(assessments_generator, assess_in)
-                async for event in stream_agent_response(agent_context, streamed2):
-                    yield event
-
             if changed_element in ("topic", "learner_level"):
-                ft_r = await Runner.run(ft_full_generator, agent_input)
-                ft_out = str(ft_r.final_output) if ft_r.final_output else ""
-                result = Runner.run_streamed(ft_full_generator, agent_input)
-                async for event in stream_agent_response(agent_context, result):
+                ft_out = str((await Runner.run(ft_full_generator, agent_input)).final_output or "")
+                async for event in stream_agent_response(agent_context, Runner.run_streamed(ft_full_generator, agent_input)):
                     yield event
-                async for event in activities_then_assessments(agent_input, ft_out):
+                act_input = append_context(agent_input, ft_out)
+                act_out = str((await Runner.run(activities_generator, act_input)).final_output or "")
+                async for event in stream_agent_response(agent_context, Runner.run_streamed(activities_generator, act_input)):
+                    yield event
+                assess_input = append_context(act_input, act_out)
+                async for event in stream_agent_response(agent_context, Runner.run_streamed(assessments_generator, assess_input)):
                     yield event
 
             elif changed_element == "objectives":
-                ft_r = await Runner.run(ft_objectives_generator, agent_input)
-                ft_out = str(ft_r.final_output) if ft_r.final_output else ""
-                result = Runner.run_streamed(ft_objectives_generator, agent_input)
-                async for event in stream_agent_response(agent_context, result):
+                ft_out = str((await Runner.run(ft_objectives_generator, agent_input)).final_output or "")
+                async for event in stream_agent_response(agent_context, Runner.run_streamed(ft_objectives_generator, agent_input)):
                     yield event
-                async for event in activities_then_assessments(agent_input, ft_out):
+                act_input = append_context(agent_input, ft_out)
+                act_out = str((await Runner.run(activities_generator, act_input)).final_output or "")
+                async for event in stream_agent_response(agent_context, Runner.run_streamed(activities_generator, act_input)):
+                    yield event
+                assess_input = append_context(act_input, act_out)
+                async for event in stream_agent_response(agent_context, Runner.run_streamed(assessments_generator, assess_input)):
                     yield event
 
             elif changed_element == "learning_theory":
-                ft_r = await Runner.run(ft_theory_generator, agent_input)
-                ft_out = str(ft_r.final_output) if ft_r.final_output else ""
-                result = Runner.run_streamed(ft_theory_generator, agent_input)
-                async for event in stream_agent_response(agent_context, result):
+                ft_out = str((await Runner.run(ft_theory_generator, agent_input)).final_output or "")
+                async for event in stream_agent_response(agent_context, Runner.run_streamed(ft_theory_generator, agent_input)):
                     yield event
-
-                strat_in = append_to_input(agent_input, ft_out)
-                strat_r = await Runner.run(ft_strategy_generator, strat_in)
-                strat_out = str(strat_r.final_output) if strat_r.final_output else ""
-                result = Runner.run_streamed(ft_strategy_generator, strat_in)
-                async for event in stream_agent_response(agent_context, result):
+                strat_input = append_context(agent_input, ft_out)
+                strat_out = str((await Runner.run(ft_strategy_generator, strat_input)).final_output or "")
+                async for event in stream_agent_response(agent_context, Runner.run_streamed(ft_strategy_generator, strat_input)):
                     yield event
-                async for event in activities_then_assessments(strat_in, strat_out):
+                act_input = append_context(strat_input, strat_out)
+                act_out = str((await Runner.run(activities_generator, act_input)).final_output or "")
+                async for event in stream_agent_response(agent_context, Runner.run_streamed(activities_generator, act_input)):
+                    yield event
+                assess_input = append_context(act_input, act_out)
+                async for event in stream_agent_response(agent_context, Runner.run_streamed(assessments_generator, assess_input)):
                     yield event
 
             elif changed_element == "teaching_strategy":
-                ft_r = await Runner.run(ft_strategy_generator, agent_input)
-                ft_out = str(ft_r.final_output) if ft_r.final_output else ""
-                result = Runner.run_streamed(ft_strategy_generator, agent_input)
-                async for event in stream_agent_response(agent_context, result):
+                ft_out = str((await Runner.run(ft_strategy_generator, agent_input)).final_output or "")
+                async for event in stream_agent_response(agent_context, Runner.run_streamed(ft_strategy_generator, agent_input)):
                     yield event
-                async for event in activities_then_assessments(agent_input, ft_out):
+                act_input = append_context(agent_input, ft_out)
+                act_out = str((await Runner.run(activities_generator, act_input)).final_output or "")
+                async for event in stream_agent_response(agent_context, Runner.run_streamed(activities_generator, act_input)):
+                    yield event
+                assess_input = append_context(act_input, act_out)
+                async for event in stream_agent_response(agent_context, Runner.run_streamed(assessments_generator, assess_input)):
                     yield event
 
             elif changed_element == "duration":
-                async for event in activities_then_assessments(agent_input):
+                act_out = str((await Runner.run(activities_generator, agent_input)).final_output or "")
+                async for event in stream_agent_response(agent_context, Runner.run_streamed(activities_generator, agent_input)):
+                    yield event
+                assess_input = append_context(agent_input, act_out)
+                async for event in stream_agent_response(agent_context, Runner.run_streamed(assessments_generator, assess_input)):
                     yield event
 
             elif changed_element == "activities":
-                result = Runner.run_streamed(activities_generator, agent_input)
-                async for event in stream_agent_response(agent_context, result):
+                async for event in stream_agent_response(agent_context, Runner.run_streamed(activities_generator, agent_input)):
                     yield event
 
             elif changed_element == "assessments":
-                result = Runner.run_streamed(assessments_generator, agent_input)
-                async for event in stream_agent_response(agent_context, result):
+                async for event in stream_agent_response(agent_context, Runner.run_streamed(assessments_generator, agent_input)):
                     yield event
 
             else:
-                result = Runner.run_streamed(general_agent, agent_input)
-                async for event in stream_agent_response(agent_context, result):
+                async for event in stream_agent_response(agent_context, Runner.run_streamed(general_agent, agent_input)):
                     yield event
 
 StarterChatServer = LessonPlannerServer
