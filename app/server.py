@@ -46,20 +46,35 @@ Always return valid values for all string fields even if empty.""",
 
 intent_agent = Agent(
     name="Intent_detector",
-    instructions="""You analyze the teacher's latest message in the context of a lesson plan conversation.
+    instructions="""You classify the teacher's LATEST message. Read the full conversation for context.
 
-Classify the intent as one of:
-- "new_lesson": Teacher is providing new lesson details or starting fresh
-- "regenerate": Teacher wants a completely new version of the same lesson (e.g. "not good", "try again", "regenerate", "different one")
-- "modify": Teacher wants to change a specific part of the lesson plan
-- "get_info": Teacher hasn't provided enough details yet
-- "other": General question or unclear
+INTENT OPTIONS:
+- "new_lesson": Teacher provides new lesson details or wants a lesson on a new topic
+- "regenerate": Teacher is unhappy with the CURRENT lesson and wants it redone with SAME details
+- "modify": Teacher wants to change ONE specific section of the current lesson plan
+- "get_info": Not enough details provided yet
+- "other": Off-topic or general question
 
-If intent is "modify", also identify what changed in changed_element as one of:
+RULES:
+- "regenerate" = same topic, completely new content. The whole thing is bad, start over.
+- "modify" = keep most of the plan, change ONE specific part only
+- If teacher says "not good", "different one", "try again", "start over", "redo" → ALWAYS "regenerate"
+- If teacher says "change the [section]", "update the [section]", "modify the [section]" → ALWAYS "modify"
+
+EXAMPLES:
+- "This is not good, give me a different one" → {"intent": "regenerate", "changed_element": ""}
+- "Try again" → {"intent": "regenerate", "changed_element": ""}
+- "I don't like it, redo this" → {"intent": "regenerate", "changed_element": ""}
+- "Change the objectives to focus on practical skills" → {"intent": "modify", "changed_element": "objectives"}
+- "Make the assessments shorter" → {"intent": "modify", "changed_element": "assessments"}
+- "Update the learning theory" → {"intent": "modify", "changed_element": "learning_theory"}
+
+If intent is "modify", set changed_element to ONE of:
 topic, learner_level, duration, objectives, learning_theory, teaching_strategy, activities, assessments
 
-Reply with ONLY valid JSON like: {"intent": "modify", "changed_element": "objectives"}
-or {"intent": "new_lesson", "changed_element": ""}""",
+Return ONLY valid JSON:
+{"intent": "regenerate", "changed_element": ""}
+{"intent": "modify", "changed_element": "objectives"}""",
     model="gpt-4.1",
     output_type=IntentSchema,
     model_settings=ModelSettings(temperature=0, max_tokens=100, store=True)
@@ -241,6 +256,65 @@ TIME RULES (STRICTLY ENFORCED):
     model_settings=ModelSettings(max_tokens=4096, store=True)
 )
 
+def get_cascade(changed_element: str) -> dict:
+    ft_elements = {"topic", "learner_level", "objectives", "learning_theory"}
+    activities_elements = {"topic", "learner_level", "duration", "objectives",
+                           "learning_theory", "teaching_strategy", "activities"}
+    return {
+        "needs_ft_model": changed_element in ft_elements,
+        "needs_activities": changed_element in activities_elements,
+        "needs_assessments_only": changed_element == "assessments",
+    }
+
+assessments_only_agent = Agent(
+    name="Assessments_Only_Generator",
+    instructions="""You regenerate ONLY the Assessments section of an existing lesson plan.
+Look at the full lesson plan in the conversation. Keep everything else unchanged.
+Use the same objectives, topic, learner level, and duration.
+
+TIME CALCULATION (MANDATORY):
+1. Lecture time = 65% of total duration
+2. Remaining time = total duration - lecture time
+3. Assessments budget = 30% of remaining time
+4. Sum of all assessment times MUST equal assessments budget exactly
+5. Create exactly 3 assessments
+
+OUTPUT EXACTLY THIS FORMAT:
+
+### Assessments
+
+1. [Title]
+- Aligned Objective(s): ...
+- Format: ...
+- Description: ...
+- Time Required: X minutes
+
+2. [Title]
+- Aligned Objective(s): ...
+- Format: ...
+- Description: ...
+- Time Required: X minutes
+
+3. [Title]
+- Aligned Objective(s): ...
+- Format: ...
+- Description: ...
+- Time Required: X minutes
+
+### Time Summary
+- Total Activity Time: X minutes (unchanged)
+- Total Assessment Time: X minutes
+- Grand Total: X minutes
+
+---
+✅ Lesson plan complete! You can:
+- Ask me to **regenerate** this lesson plan
+- Ask me to **modify** a specific section
+- Provide details for a **new lesson plan**""",
+    model="o4-mini",
+    model_settings=ModelSettings(max_tokens=1024, store=True)
+)
+
 
 class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
     def __init__(self) -> None:
@@ -276,9 +350,29 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
         changed_element = intent_output.changed_element.strip().lower() if intent_output else ""
 
         if intent == "modify":
-            result = Runner.run_streamed(modifier_agent, agent_input)
-            async for event in stream_agent_response(agent_context, result):
-                yield event
+            cascade = get_cascade(changed_element)
+
+            if cascade["needs_assessments_only"]:
+                # Only assessments change — stream assessments agent directly
+                async for event in stream_agent_response(agent_context, Runner.run_streamed(assessments_only_agent, agent_input)):
+                    yield event
+
+            elif cascade["needs_ft_model"]:
+                # ft model runs non-streamed (fast), then stream activities_generator
+                ft_result = await Runner.run(lesson_plan_generator, agent_input)
+                ft_output = str(ft_result.final_output or "")
+                enriched_input = agent_input + [{"role": "assistant", "content": ft_output}]
+                async for event in stream_agent_response(agent_context, Runner.run_streamed(activities_generator, enriched_input)):
+                    yield event
+
+            elif cascade["needs_activities"]:
+                # No ft model needed, just regenerate activities
+                async for event in stream_agent_response(agent_context, Runner.run_streamed(activities_generator, agent_input)):
+                    yield event
+
+            else:
+                async for event in stream_agent_response(agent_context, Runner.run_streamed(general_agent, agent_input)):
+                    yield event
 
         elif intent == "other":
             result = Runner.run_streamed(general_agent, agent_input)
