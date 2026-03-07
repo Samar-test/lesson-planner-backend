@@ -60,13 +60,13 @@ CASCADE_RULES: dict[str, dict] = {
         "assessments_only": False,
     },
     "objectives": {
-        "ft_sections": ["teaching_strategy"],
+        "ft_sections": ["objectives", "teaching_strategy"],
         "needs_activities": True,
         "activities_only": False,
         "assessments_only": False,
     },
     "learning_theory": {
-        "ft_sections": ["teaching_strategy"],
+        "ft_sections": ["learning_theory", "teaching_strategy"],
         "needs_activities": True,
         "activities_only": False,
         "assessments_only": False,
