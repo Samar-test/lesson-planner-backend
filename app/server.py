@@ -19,6 +19,9 @@ web_search_preview = WebSearchTool(
     user_location={"type": "approximate"}
 )
 
+
+# ── Schemas ──────────────────────────────────────────────────────────────
+
 class InfoCollectorAgentSchema(BaseModel):
     has_all_details: bool
     domain: str
@@ -27,9 +30,13 @@ class InfoCollectorAgentSchema(BaseModel):
     duration: float
     learner_level: str
 
+
 class IntentSchema(BaseModel):
     intent: str
     changed_element: str
+
+
+# ── Agents ───────────────────────────────────────────────────────────────
 
 info_collector_agent = Agent(
     name="Info_collector_agent",
@@ -46,35 +53,42 @@ Always return valid values for all string fields even if empty.""",
 
 intent_agent = Agent(
     name="Intent_detector",
-    instructions="""You classify the teacher's LATEST message. Read the full conversation for context.
+    instructions="""You analyze the teacher's latest message in the context of a lesson plan conversation.
 
-INTENT OPTIONS:
-- "new_lesson": Teacher provides new lesson details or wants a lesson on a new topic
-- "regenerate": Teacher is unhappy with the CURRENT lesson and wants it redone with SAME details
-- "modify": Teacher wants to change ONE specific section of the current lesson plan
-- "get_info": Not enough details provided yet
-- "other": Off-topic or general question
+Classify the intent as one of:
+- "new_lesson": Teacher is providing new lesson details or starting fresh
+- "regenerate": Teacher wants a completely new/different version of the ENTIRE lesson plan. They are unhappy with the whole thing, not a specific section.
+- "modify": Teacher wants to change a SPECIFIC part of the lesson plan (objectives, activities, assessments, etc.)
+- "get_info": Teacher hasn't provided enough details yet
+- "other": General question or unclear
 
-RULES:
-- "regenerate" = same topic, completely new content. The whole thing is bad, start over.
-- "modify" = keep most of the plan, change ONE specific part only
-- If teacher says "not good", "different one", "try again", "start over", "redo" → ALWAYS "regenerate"
-- If teacher says "change the [section]", "update the [section]", "modify the [section]" → ALWAYS "modify"
+CRITICAL DISTINCTION between regenerate vs modify:
+- "regenerate" = vague dissatisfaction with the whole plan, wants a fresh take. NO specific section mentioned.
+- "modify" = targets a specific section or element to change.
 
-EXAMPLES:
-- "This is not good, give me a different one" → {"intent": "regenerate", "changed_element": ""}
-- "Try again" → {"intent": "regenerate", "changed_element": ""}
-- "I don't like it, redo this" → {"intent": "regenerate", "changed_element": ""}
-- "Change the objectives to focus on practical skills" → {"intent": "modify", "changed_element": "objectives"}
-- "Make the assessments shorter" → {"intent": "modify", "changed_element": "assessments"}
-- "Update the learning theory" → {"intent": "modify", "changed_element": "learning_theory"}
+Examples of REGENERATE:
+- "This is not good, give me a different one" → regenerate
+- "I don't like this, try again" → regenerate
+- "Not what I wanted, start over" → regenerate
+- "Can you redo this?" → regenerate
+- "Generate another one" → regenerate
+- "This doesn't work for my class" → regenerate
 
-If intent is "modify", set changed_element to ONE of:
+Examples of MODIFY:
+- "Change the learning objectives to focus on practical skills" → modify, objectives
+- "Make the assessments shorter" → modify, assessments
+- "Change only the assessments" → modify, assessments
+- "I want different activities" → modify, activities
+- "Update the teaching strategy to use project-based learning" → modify, teaching_strategy
+- "Change the duration to 90 minutes" → modify, duration
+- "Switch the topic to cloud security" → modify, topic
+- "Change learner level to advanced" → modify, learner_level
+
+If intent is "modify", identify changed_element as one of:
 topic, learner_level, duration, objectives, learning_theory, teaching_strategy, activities, assessments
 
-Return ONLY valid JSON:
-{"intent": "regenerate", "changed_element": ""}
-{"intent": "modify", "changed_element": "objectives"}""",
+Reply with ONLY valid JSON like: {"intent": "modify", "changed_element": "objectives"}
+or {"intent": "regenerate", "changed_element": ""}""",
     model="gpt-4.1",
     output_type=IntentSchema,
     model_settings=ModelSettings(temperature=0, max_tokens=100, store=True)
@@ -104,6 +118,42 @@ Generate a complete lesson plan with exactly this format:
 ### Teaching Strategy
 - Name:
 - Justification:""",
+    model="ft:gpt-3.5-turbo-1106:kau:lesson-plan2:CDfU4BQj",
+    model_settings=ModelSettings(temperature=1, top_p=1, max_tokens=2048, store=True)
+)
+
+# ── This agent is used during modify to regenerate ONLY ft-model sections ──
+# It receives explicit instructions about WHAT to regenerate based on the change.
+ft_modify_agent = Agent(
+    name="FT_modify_generator",
+    instructions="""You are a lesson plan editor using your expertise in cybersecurity education.
+
+Look at the FULL conversation history to find the current lesson plan and the teacher's requested change.
+
+You MUST output the following sections based on the instructions given to you in the user's context message.
+Use exactly this format for whichever sections you are told to regenerate:
+
+### Lesson Information
+- Domain: ...
+- Course title: ...
+- Topic: ...
+- Duration: ...
+- Learner level: ...
+
+### Learning Objectives
+1. ...
+2. ...
+3. ...
+
+### Learning Theory
+- Name:
+- Justification:
+
+### Teaching Strategy
+- Name:
+- Justification:
+
+IMPORTANT: Always output ALL FOUR sections above. For sections you are told to KEEP, copy them exactly from the existing lesson plan. For sections you are told to REGENERATE, create new content that reflects the teacher's requested change.""",
     model="ft:gpt-3.5-turbo-1106:kau:lesson-plan2:CDfU4BQj",
     model_settings=ModelSettings(temperature=1, top_p=1, max_tokens=2048, store=True)
 )
@@ -197,6 +247,128 @@ After the time summary, end with exactly:
     model_settings=ModelSettings(max_tokens=4096, store=True)
 )
 
+# ── Assessments-only agent: lightweight, focused ──
+assessments_only_agent = Agent(
+    name="Assessments_only_generator",
+    instructions="""You are an expert in cybersecurity education assessment design.
+
+Look at the FULL conversation history to find the current lesson plan. You must regenerate ONLY the assessments section while keeping everything else the same.
+
+Your output must include the COMPLETE lesson plan with ALL sections. Copy the existing sections exactly, and ONLY create new content for the Assessments section.
+
+Output format (ALL sections, in this order):
+
+### Lesson Information
+(copy exactly from existing plan)
+
+### Learning Objectives
+(copy exactly from existing plan)
+
+### Learning Theory
+(copy exactly from existing plan)
+
+### Teaching Strategy
+(copy exactly from existing plan)
+
+### Time Allocation Calculation
+(copy exactly from existing plan)
+
+### Learning Activities
+(copy exactly from existing plan)
+
+### Assessments
+
+(CREATE NEW assessments here. They must:
+- Align with the existing learning objectives
+- Fit within the assessments time budget from the Time Allocation
+- Each assessment must specify: Aligned Objective(s), Format, Description, Time Required
+- Total assessment time must equal the assessments budget exactly)
+
+1.
+- Aligned Objective(s): …
+- Format: …
+- Description: …
+- Time Required: X minutes
+
+2.
+- Aligned Objective(s): …
+- Format: …
+- Description: …
+- Time Required: X minutes
+
+3.
+- Aligned Objective(s): …
+- Format: …
+- Description: …
+- Time Required: X minutes
+
+### Time Summary
+- Total Activity Time: X minutes (same as before)
+- Total Assessment Time: X minutes (must equal assessments budget)
+- Grand Total: X minutes (MUST equal remaining time)
+
+After the time summary, end with exactly:
+---
+✅ Lesson plan complete! You can:
+- Ask me to **regenerate** this lesson plan
+- Ask me to **modify** a specific section
+- Provide details for a **new lesson plan**""",
+    model="o4-mini",
+    model_settings=ModelSettings(max_tokens=4096, store=True)
+)
+
+# ── Activities-only agent: regenerates activities keeping everything else ──
+activities_only_agent = Agent(
+    name="Activities_only_generator",
+    instructions="""You are an expert in cybersecurity education and instructional design.
+
+Look at the FULL conversation history to find the current lesson plan. You must regenerate ONLY the Learning Activities section while keeping everything else the same.
+
+Your output must include the COMPLETE lesson plan with ALL sections. Copy the existing sections exactly, and ONLY create new content for the Learning Activities section.
+
+Output format (ALL sections, in this order):
+
+### Lesson Information
+(copy exactly from existing plan)
+
+### Learning Objectives
+(copy exactly from existing plan)
+
+### Learning Theory
+(copy exactly from existing plan)
+
+### Teaching Strategy
+(copy exactly from existing plan)
+
+### Time Allocation Calculation
+(copy exactly from existing plan)
+
+### Learning Activities
+
+(CREATE NEW activities here. They must:
+- Align with the existing learning objectives
+- Fit within the activities time budget from the Time Allocation
+- Each activity must specify: Aligned Objective(s), Description, Steps, Time Required
+- Total activity time must equal the activities budget exactly)
+
+### Assessments
+(copy exactly from existing plan)
+
+### Time Summary
+- Total Activity Time: X minutes (must equal activities budget)
+- Total Assessment Time: X minutes (same as before)
+- Grand Total: X minutes (MUST equal remaining time)
+
+After the time summary, end with exactly:
+---
+✅ Lesson plan complete! You can:
+- Ask me to **regenerate** this lesson plan
+- Ask me to **modify** a specific section
+- Provide details for a **new lesson plan**""",
+    model="o4-mini",
+    model_settings=ModelSettings(max_tokens=4096, store=True)
+)
+
 get_data_agent = Agent(
     name="Get_data",
     instructions="""Collect the missing information needed to complete a cybersecurity lesson plan.
@@ -220,101 +392,83 @@ If they seem to want a lesson plan, remind them to provide: Domain, Course title
     model_settings=ModelSettings(temperature=1, max_tokens=512, store=True)
 )
 
-modifier_agent = Agent(
-    name="Modifier",
-    instructions="""You are a lesson plan editor. Look at the full conversation to find the current lesson plan.
 
-Apply the requested change according to these strict rules:
-
-1. If Topic changes → Regenerate: objectives, learning theory, teaching strategy, activities, assessments. Keep: lesson information structure.
-2. If Learner Level changes → Regenerate: objectives, teaching strategy, activities, assessments. Keep: learning theory, lesson information.
-3. If Duration changes → Regenerate: activities, assessments. Keep: objectives, learning theory, teaching strategy, lesson information.
-4. If Objectives change → First update the objectives as requested, then regenerate: teaching strategy, activities, assessments. Keep: learning theory, lesson information.
-5. If Learning Theory changes → Regenerate: teaching strategy, activities, assessments. Keep: objectives, lesson information.
-6. If Teaching Strategy changes → Regenerate: activities, assessments. Keep: objectives, learning theory, lesson information.
-7. If Activities change → Regenerate activities only. Keep everything else.
-8. If Assessments change → Regenerate assessments only. Keep everything else.
-
-IMPORTANT: Always output the COMPLETE updated lesson plan with ALL sections in this exact order:
-1. Lesson Information
-2. Learning Objectives
-3. Learning Theory
-4. Teaching Strategy
-5. Time Allocation Calculation
-6. Learning Activities
-7. Assessments
-8. Time Summary
-
-TIME RULES (STRICTLY ENFORCED):
-- Lecture = 65% of total duration
-- Remaining = total duration - lecture time
-- Activities budget = 70% of remaining
-- Assessments budget = 30% of remaining
-- Sum of all activity times MUST equal activities budget exactly
-- Sum of all assessment times MUST equal assessments budget exactly""",
-    model="o4-mini",
-    model_settings=ModelSettings(max_tokens=4096, store=True)
-)
+# ── Cascade Logic ────────────────────────────────────────────────────────
 
 def get_cascade(changed_element: str) -> dict:
-    ft_elements = {"topic", "learner_level", "objectives", "learning_theory"}
-    activities_elements = {"topic", "learner_level", "duration", "objectives",
-                           "learning_theory", "teaching_strategy", "activities"}
-    return {
-        "needs_ft_model": changed_element in ft_elements,
-        "needs_activities": changed_element in activities_elements,
-        "needs_assessments_only": changed_element == "assessments",
+    """Determine which agents need to run based on what changed."""
+    # ft model handles: objectives, learning_theory, teaching_strategy
+    # o4-mini handles: activities, assessments
+
+    cascades = {
+        "topic": {
+            "needs_ft_model": True,
+            "ft_regenerate": ["objectives", "learning_theory", "teaching_strategy"],
+            "needs_activities_and_assessments": True,
+            "needs_activities_only": False,
+            "needs_assessments_only": False,
+        },
+        "learner_level": {
+            "needs_ft_model": True,
+            "ft_regenerate": ["objectives", "teaching_strategy"],
+            "needs_activities_and_assessments": True,
+            "needs_activities_only": False,
+            "needs_assessments_only": False,
+        },
+        "duration": {
+            "needs_ft_model": False,
+            "ft_regenerate": [],
+            "needs_activities_and_assessments": True,
+            "needs_activities_only": False,
+            "needs_assessments_only": False,
+        },
+        "objectives": {
+            "needs_ft_model": True,
+            "ft_regenerate": ["objectives", "teaching_strategy"],
+            "needs_activities_and_assessments": True,
+            "needs_activities_only": False,
+            "needs_assessments_only": False,
+        },
+        "learning_theory": {
+            "needs_ft_model": True,
+            "ft_regenerate": ["teaching_strategy"],
+            "needs_activities_and_assessments": True,
+            "needs_activities_only": False,
+            "needs_assessments_only": False,
+        },
+        "teaching_strategy": {
+            "needs_ft_model": False,
+            "ft_regenerate": [],
+            "needs_activities_and_assessments": True,
+            "needs_activities_only": False,
+            "needs_assessments_only": False,
+        },
+        "activities": {
+            "needs_ft_model": False,
+            "ft_regenerate": [],
+            "needs_activities_and_assessments": False,
+            "needs_activities_only": True,
+            "needs_assessments_only": False,
+        },
+        "assessments": {
+            "needs_ft_model": False,
+            "ft_regenerate": [],
+            "needs_activities_and_assessments": False,
+            "needs_activities_only": False,
+            "needs_assessments_only": True,
+        },
     }
 
-assessments_only_agent = Agent(
-    name="Assessments_Only_Generator",
-    instructions="""You regenerate ONLY the Assessments section of an existing lesson plan.
-Look at the full lesson plan in the conversation. Keep everything else unchanged.
-Use the same objectives, topic, learner level, and duration.
+    return cascades.get(changed_element, {
+        "needs_ft_model": False,
+        "ft_regenerate": [],
+        "needs_activities_and_assessments": True,
+        "needs_activities_only": False,
+        "needs_assessments_only": False,
+    })
 
-TIME CALCULATION (MANDATORY):
-1. Lecture time = 65% of total duration
-2. Remaining time = total duration - lecture time
-3. Assessments budget = 30% of remaining time
-4. Sum of all assessment times MUST equal assessments budget exactly
-5. Create exactly 3 assessments
 
-OUTPUT EXACTLY THIS FORMAT:
-
-### Assessments
-
-1. [Title]
-- Aligned Objective(s): ...
-- Format: ...
-- Description: ...
-- Time Required: X minutes
-
-2. [Title]
-- Aligned Objective(s): ...
-- Format: ...
-- Description: ...
-- Time Required: X minutes
-
-3. [Title]
-- Aligned Objective(s): ...
-- Format: ...
-- Description: ...
-- Time Required: X minutes
-
-### Time Summary
-- Total Activity Time: X minutes (unchanged)
-- Total Assessment Time: X minutes
-- Grand Total: X minutes
-
----
-✅ Lesson plan complete! You can:
-- Ask me to **regenerate** this lesson plan
-- Ask me to **modify** a specific section
-- Provide details for a **new lesson plan**""",
-    model="o4-mini",
-    model_settings=ModelSettings(max_tokens=1024, store=True)
-)
-
+# ── Server ───────────────────────────────────────────────────────────────
 
 class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
     def __init__(self) -> None:
@@ -343,35 +497,78 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
             request_context=context,
         )
 
-        # Detect intent
+        # ── Step 1: Detect intent ──
         intent_result = await Runner.run(intent_agent, agent_input)
         intent_output = intent_result.final_output
         intent = intent_output.intent.strip().lower() if intent_output else "other"
         changed_element = intent_output.changed_element.strip().lower() if intent_output else ""
 
-        if intent == "modify":
+        # ── Step 2: Route based on intent ──
+
+        if intent == "modify" and changed_element:
+            # Use cascade logic to determine which agents to call
             cascade = get_cascade(changed_element)
 
             if cascade["needs_assessments_only"]:
-                # Only assessments change — stream assessments agent directly
-                async for event in stream_agent_response(agent_context, Runner.run_streamed(assessments_only_agent, agent_input)):
+                # Simple case: just regenerate assessments
+                result = Runner.run_streamed(assessments_only_agent, agent_input)
+                async for event in stream_agent_response(agent_context, result):
+                    yield event
+
+            elif cascade["needs_activities_only"]:
+                # Simple case: just regenerate activities
+                result = Runner.run_streamed(activities_only_agent, agent_input)
+                async for event in stream_agent_response(agent_context, result):
                     yield event
 
             elif cascade["needs_ft_model"]:
-                # ft model runs non-streamed (fast), then stream activities_generator
-                ft_result = await Runner.run(lesson_plan_generator, agent_input)
-                ft_output = str(ft_result.final_output or "")
-                enriched_input = agent_input + [{"role": "assistant", "content": ft_output}]
-                async for event in stream_agent_response(agent_context, Runner.run_streamed(activities_generator, enriched_input)):
-                    yield event
+                # Complex case: ft model first (non-streamed), then stream activities+assessments
+                # Build context instruction for ft model
+                regen_list = ", ".join(cascade["ft_regenerate"])
+                ft_context_msg = (
+                    f"The teacher wants to change: {changed_element}. "
+                    f"Regenerate these sections: {regen_list}. "
+                    f"Keep all other sections exactly as they are in the current lesson plan. "
+                    f"Output the complete Lesson Information, Learning Objectives, Learning Theory, and Teaching Strategy sections."
+                )
 
-            elif cascade["needs_activities"]:
-                # No ft model needed, just regenerate activities
-                async for event in stream_agent_response(agent_context, Runner.run_streamed(activities_generator, agent_input)):
+                # Add context instruction to the input
+                ft_input = agent_input + [{"role": "user", "content": ft_context_msg}]
+
+                # Run ft model NON-STREAMED (fast, ~3-5 seconds)
+                ft_result = await Runner.run(ft_modify_agent, ft_input)
+                ft_output = ft_result.final_output if ft_result.final_output else ""
+
+                # Now stream activities+assessments with ft output as context
+                activities_context_msg = (
+                    f"Here is the updated lesson plan (Lesson Information, Objectives, Theory, Strategy):\n\n"
+                    f"{ft_output}\n\n"
+                    f"Now generate the Time Allocation, Learning Activities, Assessments, and Time Summary "
+                    f"sections based on the above. Follow the time rules strictly."
+                )
+                activities_input = agent_input + [
+                    {"role": "assistant", "content": str(ft_output)},
+                    {"role": "user", "content": activities_context_msg}
+                ]
+
+                # Stream the final output (activities + assessments)
+                result = Runner.run_streamed(activities_generator, activities_input)
+                async for event in stream_agent_response(agent_context, result):
                     yield event
 
             else:
-                async for event in stream_agent_response(agent_context, Runner.run_streamed(general_agent, agent_input)):
+                # Duration or teaching_strategy change: no ft model needed,
+                # just regenerate activities + assessments
+                duration_context_msg = (
+                    f"The teacher wants to change: {changed_element}. "
+                    f"Look at the current lesson plan in the conversation. "
+                    f"Keep the Lesson Information, Learning Objectives, Learning Theory, and Teaching Strategy exactly as they are. "
+                    f"Regenerate ONLY the Time Allocation, Learning Activities, Assessments, and Time Summary based on the change."
+                )
+                activities_input = agent_input + [{"role": "user", "content": duration_context_msg}]
+
+                result = Runner.run_streamed(activities_generator, activities_input)
+                async for event in stream_agent_response(agent_context, result):
                     yield event
 
         elif intent == "other":
@@ -380,15 +577,17 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
                 yield event
 
         else:
-            # new_lesson, regenerate, get_info
+            # new_lesson, regenerate, get_info → same flow as before
             info_result = await Runner.run(info_collector_agent, agent_input)
             info = info_result.final_output
 
             if info and info.has_all_details:
+                # Stream ft model output (lesson info, objectives, theory, strategy)
                 lesson_result = Runner.run_streamed(lesson_plan_generator, agent_input)
                 async for event in stream_agent_response(agent_context, lesson_result):
                     yield event
 
+                # Reload thread to include ft model output
                 updated_page = await self.store.load_thread_items(
                     thread.id, after=None, limit=MAX_RECENT_ITEMS,
                     order="desc", context=context,
@@ -396,6 +595,7 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
                 updated_items = list(reversed(updated_page.data))
                 updated_input = await simple_to_agent_input(updated_items)
 
+                # Stream activities + assessments
                 activities_result = Runner.run_streamed(activities_generator, updated_input)
                 async for event in stream_agent_response(agent_context, activities_result):
                     yield event
