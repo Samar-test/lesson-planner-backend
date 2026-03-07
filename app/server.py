@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, AsyncIterator
 
 from agents import Runner, Agent, WebSearchTool, ModelSettings
@@ -21,74 +22,81 @@ web_search_preview = WebSearchTool(
 )
 
 # ── Lesson Plan JSON Schema ───────────────────────────────────────────────
-# This is the single source of truth stored between turns.
-# Keys map directly to the sections of the lesson plan.
 EMPTY_PLAN: dict[str, Any] = {
     "domain": "",
     "course_title": "",
     "topic": "",
     "duration": "",
     "learner_level": "",
-    "objectives": [],           # list of strings
+    "objectives": [],
     "learning_theory": {"name": "", "justification": ""},
     "teaching_strategy": {"name": "", "justification": ""},
-    "time_allocation": {},      # raw dict from activities agent
-    "activities": [],           # list of dicts
-    "assessments": [],          # list of dicts
-    "time_summary": {},         # raw dict from activities agent
+    "time_allocation": {},
+    "activities": [],
+    "assessments": [],
+    "time_summary": {},
 }
 
-# Memory key for storing lesson plan JSON per thread
 PLAN_KEY = "lesson_plan"
 
-
-# ── What each changed element cascades to ────────────────────────────────
-# "ft_sections"        → sections the ft model must regenerate
-# "needs_activities"   → whether activities+assessments must be regenerated
-
+# ── Cascade Rules ─────────────────────────────────────────────────────────
 CASCADE_RULES: dict[str, dict] = {
     "topic": {
         "ft_sections": ["objectives", "learning_theory", "teaching_strategy"],
         "needs_activities": True,
+        "activities_only": False,
+        "assessments_only": False,
     },
     "learner_level": {
         "ft_sections": ["objectives", "teaching_strategy"],
         "needs_activities": True,
+        "activities_only": False,
+        "assessments_only": False,
     },
     "duration": {
         "ft_sections": [],
         "needs_activities": True,
+        "activities_only": False,
+        "assessments_only": False,
     },
     "objectives": {
         "ft_sections": ["teaching_strategy"],
         "needs_activities": True,
+        "activities_only": False,
+        "assessments_only": False,
     },
     "learning_theory": {
         "ft_sections": ["teaching_strategy"],
         "needs_activities": True,
+        "activities_only": False,
+        "assessments_only": False,
     },
     "teaching_strategy": {
         "ft_sections": [],
         "needs_activities": True,
+        "activities_only": False,
+        "assessments_only": False,
     },
     "activities": {
         "ft_sections": [],
-        "needs_activities": True,   # activities_only flag handled separately
+        "needs_activities": True,
         "activities_only": True,
+        "assessments_only": False,
     },
     "assessments": {
         "ft_sections": [],
-        "needs_activities": True,   # assessments_only flag handled separately
+        "needs_activities": True,
+        "activities_only": False,
         "assessments_only": True,
     },
 }
 
 
-# ── Pydantic Schemas ──────────────────────────────────────────────────────
+# ── Pydantic Schema ───────────────────────────────────────────────────────
 
 class OrchestratorOutput(BaseModel):
-    intent: str                  # "new_lesson" | "modify" | "regenerate" | "get_info" | "other"
-    changed_element: str         # only set when intent == "modify"
+    intent: str
+    changed_element: str
     has_all_details: bool
     domain: str
     course_title: str
@@ -98,17 +106,7 @@ class OrchestratorOutput(BaseModel):
     missing_fields: list[str]
 
 
-class FTModelOutput(BaseModel):
-    objectives: list[str]
-    learning_theory_name: str
-    learning_theory_justification: str
-    teaching_strategy_name: str
-    teaching_strategy_justification: str
-
-
-# ── Agent 1: Orchestrator ─────────────────────────────────────────────────
-# Single agent that does intent detection + info extraction in one shot.
-# gpt-4.1 is reliable, fast, and follows structured output perfectly.
+# ── Agents ────────────────────────────────────────────────────────────────
 
 orchestrator_agent = Agent(
     name="Orchestrator",
@@ -143,11 +141,6 @@ Always return valid values for all string fields even if empty string.""",
     model_settings=ModelSettings(temperature=0, max_tokens=512, store=True)
 )
 
-
-# ── Agent 2: FT Model (kept exactly as-is in spirit) ─────────────────────
-# Fine-tuned model handles: objectives, learning_theory, teaching_strategy
-# We prompt it to return structured JSON so we can surgically update the plan.
-
 ft_model_agent = Agent(
     name="FT_lesson_planner",
     instructions="""You are a cybersecurity lesson plan expert.
@@ -155,26 +148,25 @@ Given the lesson details, generate the requested sections.
 
 You will receive a message telling you EXACTLY which sections to generate and what the current lesson details are.
 
-Always respond with valid JSON in this exact format:
-{
-  "objectives": ["objective 1", "objective 2", "objective 3"],
-  "learning_theory_name": "...",
-  "learning_theory_justification": "...",
-  "teaching_strategy_name": "...",
-  "teaching_strategy_justification": "..."
-}
-
 If a section is marked as KEEP, copy it exactly from the provided current plan.
 If a section is marked as REGENERATE, create new high-quality content for it.
-Always generate exactly 3 learning objectives.""",
+Always generate exactly 3 learning objectives.
+
+Respond using EXACTLY this format (no extra text, no markdown):
+
+OBJECTIVES:
+1. <objective 1>
+2. <objective 2>
+3. <objective 3>
+
+LEARNING_THEORY_NAME: <name>
+LEARNING_THEORY_JUSTIFICATION: <justification>
+
+TEACHING_STRATEGY_NAME: <name>
+TEACHING_STRATEGY_JUSTIFICATION: <justification>""",
     model="ft:gpt-3.5-turbo-1106:kau:lesson-plan2:CDfU4BQj",
-    output_type=FTModelOutput,
     model_settings=ModelSettings(temperature=1, top_p=1, max_tokens=1024, store=True)
 )
-
-
-# ── Agent 3: Activities + Assessments Generator ───────────────────────────
-# Receives the COMPLETE current plan as clean context. No guessing.
 
 activities_generator = Agent(
     name="Activities_Assessments_Generator",
@@ -197,7 +189,7 @@ Number of activities/assessments:
 
 Each activity/assessment MUST have a time estimate. Sums MUST be exact.
 
-Respond ONLY with valid JSON in this exact format:
+Respond ONLY with valid JSON in this exact format (no extra text, no markdown):
 {
   "time_allocation": {
     "total_duration_minutes": 0,
@@ -229,16 +221,11 @@ Respond ONLY with valid JSON in this exact format:
     "total_assessment_time": 0,
     "grand_total": 0
   }
-}
-
-No extra text. No markdown. Pure JSON only.""",
+}""",
     model="gpt-4.1",
     tools=[web_search_preview],
     model_settings=ModelSettings(temperature=0.7, max_tokens=4096, store=True)
 )
-
-
-# ── Agent 4: General / Get Info ───────────────────────────────────────────
 
 get_info_agent = Agent(
     name="Get_info",
@@ -256,6 +243,81 @@ If the teacher asks a general question, answer it helpfully and briefly.""",
     model="gpt-4.1",
     model_settings=ModelSettings(temperature=1, max_tokens=512, store=True)
 )
+
+
+# ── FT Model Output Parser ────────────────────────────────────────────────
+
+def parse_ft_output(text: str) -> dict[str, Any]:
+    """
+    Parse the plain text output from the ft model into a structured dict.
+    The ft model does not support JSON schema output so we parse its
+    custom text format instead.
+
+    Expected format:
+        OBJECTIVES:
+        1. objective one
+        2. objective two
+        3. objective three
+
+        LEARNING_THEORY_NAME: name
+        LEARNING_THEORY_JUSTIFICATION: justification
+
+        TEACHING_STRATEGY_NAME: name
+        TEACHING_STRATEGY_JUSTIFICATION: justification
+    """
+    result: dict[str, Any] = {
+        "objectives": [],
+        "learning_theory": {"name": "", "justification": ""},
+        "teaching_strategy": {"name": "", "justification": ""},
+    }
+
+    if not text:
+        return result
+
+    # Parse objectives block
+    obj_match = re.search(r"OBJECTIVES:\s*(.*?)(?=LEARNING_THEORY_NAME:|$)", text, re.DOTALL | re.IGNORECASE)
+    if obj_match:
+        obj_block = obj_match.group(1).strip()
+        objectives = []
+        for line in obj_block.splitlines():
+            line = line.strip()
+            line = re.sub(r"^\d+[\.\)]\s*", "", line)
+            if line:
+                objectives.append(line)
+        result["objectives"] = objectives
+
+    # Parse learning theory
+    lt_name = re.search(r"LEARNING_THEORY_NAME:\s*(.+)", text, re.IGNORECASE)
+    if lt_name:
+        result["learning_theory"]["name"] = lt_name.group(1).strip()
+
+    lt_just = re.search(r"LEARNING_THEORY_JUSTIFICATION:\s*(.+)", text, re.IGNORECASE)
+    if lt_just:
+        result["learning_theory"]["justification"] = lt_just.group(1).strip()
+
+    # Parse teaching strategy
+    ts_name = re.search(r"TEACHING_STRATEGY_NAME:\s*(.+)", text, re.IGNORECASE)
+    if ts_name:
+        result["teaching_strategy"]["name"] = ts_name.group(1).strip()
+
+    ts_just = re.search(r"TEACHING_STRATEGY_JUSTIFICATION:\s*(.+)", text, re.IGNORECASE)
+    if ts_just:
+        result["teaching_strategy"]["justification"] = ts_just.group(1).strip()
+
+    return result
+
+
+def parse_activities_output(text: str) -> dict[str, Any]:
+    """Parse JSON response from activities agent, stripping markdown fences if present."""
+    if not text:
+        return {}
+    try:
+        clean = text.strip()
+        clean = re.sub(r"^```[a-z]*\n?", "", clean)
+        clean = re.sub(r"\n?```$", "", clean)
+        return json.loads(clean)
+    except (json.JSONDecodeError, Exception):
+        return {}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -344,7 +406,7 @@ def plan_to_markdown(plan: dict[str, Any]) -> str:
 
 def build_ft_prompt(plan: dict[str, Any], sections_to_regenerate: list[str], info: OrchestratorOutput) -> str:
     """Build a clear, explicit prompt for the ft model."""
-    prompt_lines = [
+    lines = [
         "Generate lesson plan sections for the following cybersecurity lesson:",
         "",
         f"Domain: {info.domain}",
@@ -358,30 +420,29 @@ def build_ft_prompt(plan: dict[str, Any], sections_to_regenerate: list[str], inf
     all_sections = ["objectives", "learning_theory", "teaching_strategy"]
     for section in all_sections:
         if section in sections_to_regenerate:
-            prompt_lines.append(f"REGENERATE {section.upper()}: Create new content for this section.")
+            lines.append(f"REGENERATE {section.upper()}: Create new content for this section.")
         else:
-            # Tell it exactly what to keep
             if section == "objectives" and plan.get("objectives"):
-                prompt_lines.append(f"KEEP OBJECTIVES: {json.dumps(plan['objectives'])}")
+                lines.append(f"KEEP OBJECTIVES: {json.dumps(plan['objectives'])}")
             elif section == "learning_theory" and plan.get("learning_theory", {}).get("name"):
                 lt = plan["learning_theory"]
-                prompt_lines.append(f"KEEP LEARNING_THEORY: Name={lt['name']}, Justification={lt['justification']}")
+                lines.append(f"KEEP LEARNING_THEORY: Name={lt['name']}, Justification={lt['justification']}")
             elif section == "teaching_strategy" and plan.get("teaching_strategy", {}).get("name"):
                 ts = plan["teaching_strategy"]
-                prompt_lines.append(f"KEEP TEACHING_STRATEGY: Name={ts['name']}, Justification={ts['justification']}")
+                lines.append(f"KEEP TEACHING_STRATEGY: Name={ts['name']}, Justification={ts['justification']}")
             else:
-                prompt_lines.append(f"REGENERATE {section.upper()}: Create new content (no existing content found).")
+                lines.append(f"REGENERATE {section.upper()}: Create new content (no existing content found).")
 
-    return "\n".join(prompt_lines)
+    return "\n".join(lines)
 
 
 def build_activities_prompt(
     plan: dict[str, Any],
     activities_only: bool = False,
-    assessments_only: bool = False
+    assessments_only: bool = False,
 ) -> str:
     """Build a clean, explicit prompt for the activities agent."""
-    prompt_lines = [
+    lines = [
         "Generate activities and assessments for this cybersecurity lesson.",
         "",
         "CURRENT LESSON PLAN:",
@@ -394,30 +455,30 @@ def build_activities_prompt(
         "Learning Objectives:",
     ]
     for i, obj in enumerate(plan.get("objectives", []), 1):
-        prompt_lines.append(f"{i}. {obj}")
+        lines.append(f"{i}. {obj}")
 
     lt = plan.get("learning_theory", {})
     ts = plan.get("teaching_strategy", {})
-    prompt_lines.append(f"\nLearning Theory: {lt.get('name', '')}")
-    prompt_lines.append(f"Teaching Strategy: {ts.get('name', '')}")
-    prompt_lines.append("")
+    lines.append(f"\nLearning Theory: {lt.get('name', '')}")
+    lines.append(f"Teaching Strategy: {ts.get('name', '')}")
+    lines.append("")
 
     if activities_only:
-        prompt_lines.append("INSTRUCTION: Regenerate ONLY the activities. Keep assessments the same.")
-        prompt_lines.append("KEEP THESE ASSESSMENTS (copy exactly into your JSON response):")
-        prompt_lines.append(json.dumps(plan.get("assessments", [])))
-        prompt_lines.append("KEEP THIS TIME ALLOCATION (copy exactly, only recalculate if duration changed):")
-        prompt_lines.append(json.dumps(plan.get("time_allocation", {})))
+        lines.append("INSTRUCTION: Regenerate ONLY the activities. Keep assessments the same.")
+        lines.append("KEEP THESE ASSESSMENTS exactly as-is in your JSON response:")
+        lines.append(json.dumps(plan.get("assessments", [])))
+        lines.append("KEEP THIS TIME ALLOCATION exactly as-is in your JSON response:")
+        lines.append(json.dumps(plan.get("time_allocation", {})))
     elif assessments_only:
-        prompt_lines.append("INSTRUCTION: Regenerate ONLY the assessments. Keep activities the same.")
-        prompt_lines.append("KEEP THESE ACTIVITIES (copy exactly into your JSON response):")
-        prompt_lines.append(json.dumps(plan.get("activities", [])))
-        prompt_lines.append("KEEP THIS TIME ALLOCATION (copy exactly):")
-        prompt_lines.append(json.dumps(plan.get("time_allocation", {})))
+        lines.append("INSTRUCTION: Regenerate ONLY the assessments. Keep activities the same.")
+        lines.append("KEEP THESE ACTIVITIES exactly as-is in your JSON response:")
+        lines.append(json.dumps(plan.get("activities", [])))
+        lines.append("KEEP THIS TIME ALLOCATION exactly as-is in your JSON response:")
+        lines.append(json.dumps(plan.get("time_allocation", {})))
     else:
-        prompt_lines.append("INSTRUCTION: Regenerate BOTH activities and assessments.")
+        lines.append("INSTRUCTION: Regenerate BOTH activities and assessments.")
 
-    return "\n".join(prompt_lines)
+    return "\n".join(lines)
 
 
 # ── Server ────────────────────────────────────────────────────────────────
@@ -435,7 +496,8 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
                 return json.loads(raw)
         except Exception:
             pass
-        return dict(EMPTY_PLAN)
+        import copy
+        return copy.deepcopy(EMPTY_PLAN)
 
     async def _save_plan(self, thread_id: str, plan: dict[str, Any], context: dict[str, Any]) -> None:
         """Save the current lesson plan JSON to the store."""
@@ -465,116 +527,91 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
             request_context=context,
         )
 
-        # Load the current lesson plan from structured storage (source of truth)
+        # Load the current lesson plan (single source of truth)
         current_plan = await self._load_plan(thread.id, context)
 
-        # ── Step 1: Orchestrator — one call, gets intent + lesson details ──
+        # ── Step 1: Orchestrator ──────────────────────────────────────────
         orch_result = await Runner.run(orchestrator_agent, agent_input)
         info: OrchestratorOutput = orch_result.final_output
 
         intent = info.intent.strip().lower()
         changed_element = info.changed_element.strip().lower()
 
-        # ── Step 2: Route based on intent ────────────────────────────────
+        # ── Step 2: Route ─────────────────────────────────────────────────
 
-        # ── CASE: Other / General question ──
+        # General question
         if intent == "other":
             result = Runner.run_streamed(get_info_agent, agent_input)
             async for event in stream_agent_response(agent_context, result):
                 yield event
             return
 
-        # ── CASE: Get info — missing details ──
+        # Missing details
         if intent == "get_info" or (intent in ("new_lesson", "regenerate") and not info.has_all_details):
             result = Runner.run_streamed(get_info_agent, agent_input)
             async for event in stream_agent_response(agent_context, result):
                 yield event
             return
 
-        # ── CASE: New lesson or full regenerate ──
+        # ── New lesson or full regenerate ─────────────────────────────────
         if intent in ("new_lesson", "regenerate"):
-            # Update plan metadata from orchestrator
             current_plan["domain"] = info.domain
             current_plan["course_title"] = info.course_title
             current_plan["topic"] = info.topic
             current_plan["duration"] = info.duration
             current_plan["learner_level"] = info.learner_level
 
-            # FT model generates all three sections
+            # FT model: objectives, learning theory, teaching strategy
             ft_prompt = build_ft_prompt(
                 current_plan,
                 sections_to_regenerate=["objectives", "learning_theory", "teaching_strategy"],
-                info=info
+                info=info,
             )
             ft_result = await Runner.run(ft_model_agent, ft_prompt)
-            ft_output: FTModelOutput = ft_result.final_output
+            ft_text = str(ft_result.final_output) if ft_result.final_output else ""
+            ft_data = parse_ft_output(ft_text)
 
-            # Update plan with ft model output
-            current_plan["objectives"] = ft_output.objectives
-            current_plan["learning_theory"] = {
-                "name": ft_output.learning_theory_name,
-                "justification": ft_output.learning_theory_justification,
-            }
-            current_plan["teaching_strategy"] = {
-                "name": ft_output.teaching_strategy_name,
-                "justification": ft_output.teaching_strategy_justification,
-            }
+            current_plan["objectives"] = ft_data["objectives"]
+            current_plan["learning_theory"] = ft_data["learning_theory"]
+            current_plan["teaching_strategy"] = ft_data["teaching_strategy"]
 
-            # Activities agent generates activities + assessments
+            # Activities agent: time allocation, activities, assessments
             act_prompt = build_activities_prompt(current_plan)
             act_result = await Runner.run(activities_generator, act_prompt)
+            act_text = str(act_result.final_output) if act_result.final_output else ""
+            act_data = parse_activities_output(act_text)
 
-            # Parse activities JSON response
-            act_text = ""
-            if act_result.final_output:
-                act_text = str(act_result.final_output)
-            else:
-                for msg in act_result.messages:
-                    if hasattr(msg, "content"):
-                        act_text += str(msg.content)
-
-            try:
-                act_text_clean = act_text.strip()
-                if act_text_clean.startswith("```"):
-                    act_text_clean = act_text_clean.split("```")[1]
-                    if act_text_clean.startswith("json"):
-                        act_text_clean = act_text_clean[4:]
-                act_data = json.loads(act_text_clean)
+            if act_data:
                 current_plan["time_allocation"] = act_data.get("time_allocation", {})
                 current_plan["activities"] = act_data.get("activities", [])
                 current_plan["assessments"] = act_data.get("assessments", [])
                 current_plan["time_summary"] = act_data.get("time_summary", {})
-            except (json.JSONDecodeError, Exception):
-                # If JSON parsing fails, store raw text and surface error
-                current_plan["activities"] = []
-                current_plan["assessments"] = []
 
-            # Save updated plan to store
             await self._save_plan(thread.id, current_plan, context)
 
-            # Stream the final markdown to the user
             markdown_output = plan_to_markdown(current_plan)
-            final_input = [{"role": "user", "content": f"Display this lesson plan:\n\n{markdown_output}"}]
-
+            display_input = [{"role": "user", "content": f"Output this lesson plan exactly as written, no changes:\n\n{markdown_output}"}]
             display_agent = Agent(
                 name="Display",
-                instructions="Output the lesson plan exactly as provided, with no changes or additions.",
+                instructions="Output the content exactly as provided. Do not change, summarize, or add anything.",
                 model="gpt-4.1-mini",
                 model_settings=ModelSettings(temperature=0, max_tokens=4096, store=False)
             )
-            result = Runner.run_streamed(display_agent, final_input)
+            result = Runner.run_streamed(display_agent, display_input)
             async for event in stream_agent_response(agent_context, result):
                 yield event
             return
 
-        # ── CASE: Modify ──
+        # ── Modify specific section ───────────────────────────────────────
         if intent == "modify" and changed_element:
             cascade = CASCADE_RULES.get(changed_element, {
                 "ft_sections": [],
                 "needs_activities": True,
+                "activities_only": False,
+                "assessments_only": False,
             })
 
-            # Update lesson metadata if it changed
+            # Update lesson metadata if a top-level field changed
             if changed_element == "topic":
                 current_plan["topic"] = info.topic
             elif changed_element == "learner_level":
@@ -587,51 +624,33 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
             assessments_only = cascade.get("assessments_only", False)
             needs_activities = cascade.get("needs_activities", False)
 
-            # ── Run FT model if needed ──
+            # Run FT model only if needed
             if ft_sections:
                 ft_prompt = build_ft_prompt(current_plan, ft_sections, info)
                 ft_result = await Runner.run(ft_model_agent, ft_prompt)
-                ft_output: FTModelOutput = ft_result.final_output
+                ft_text = str(ft_result.final_output) if ft_result.final_output else ""
+                ft_data = parse_ft_output(ft_text)
 
-                # Surgically update only the sections that were regenerated
+                # Surgically update only regenerated sections
                 if "objectives" in ft_sections:
-                    current_plan["objectives"] = ft_output.objectives
+                    current_plan["objectives"] = ft_data["objectives"]
                 if "learning_theory" in ft_sections:
-                    current_plan["learning_theory"] = {
-                        "name": ft_output.learning_theory_name,
-                        "justification": ft_output.learning_theory_justification,
-                    }
+                    current_plan["learning_theory"] = ft_data["learning_theory"]
                 if "teaching_strategy" in ft_sections:
-                    current_plan["teaching_strategy"] = {
-                        "name": ft_output.teaching_strategy_name,
-                        "justification": ft_output.teaching_strategy_justification,
-                    }
+                    current_plan["teaching_strategy"] = ft_data["teaching_strategy"]
 
-            # ── Run activities agent if needed ──
+            # Run activities agent only if needed
             if needs_activities:
                 act_prompt = build_activities_prompt(
                     current_plan,
                     activities_only=activities_only,
-                    assessments_only=assessments_only
+                    assessments_only=assessments_only,
                 )
                 act_result = await Runner.run(activities_generator, act_prompt)
+                act_text = str(act_result.final_output) if act_result.final_output else ""
+                act_data = parse_activities_output(act_text)
 
-                act_text = ""
-                if act_result.final_output:
-                    act_text = str(act_result.final_output)
-                else:
-                    for msg in act_result.messages:
-                        if hasattr(msg, "content"):
-                            act_text += str(msg.content)
-
-                try:
-                    act_text_clean = act_text.strip()
-                    if act_text_clean.startswith("```"):
-                        act_text_clean = act_text_clean.split("```")[1]
-                        if act_text_clean.startswith("json"):
-                            act_text_clean = act_text_clean[4:]
-                    act_data = json.loads(act_text_clean)
-
+                if act_data:
                     # Surgically update only what changed
                     if not assessments_only:
                         current_plan["time_allocation"] = act_data.get("time_allocation", current_plan["time_allocation"])
@@ -641,28 +660,22 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
                         current_plan["assessments"] = act_data.get("assessments", current_plan["assessments"])
                         current_plan["time_summary"] = act_data.get("time_summary", current_plan["time_summary"])
 
-                except (json.JSONDecodeError, Exception):
-                    pass  # Keep existing activities/assessments if parsing fails
-
-            # Save updated plan
             await self._save_plan(thread.id, current_plan, context)
 
-            # Stream the final markdown
             markdown_output = plan_to_markdown(current_plan)
-            final_input = [{"role": "user", "content": f"Display this lesson plan:\n\n{markdown_output}"}]
-
+            display_input = [{"role": "user", "content": f"Output this lesson plan exactly as written, no changes:\n\n{markdown_output}"}]
             display_agent = Agent(
                 name="Display",
-                instructions="Output the lesson plan exactly as provided, with no changes or additions.",
+                instructions="Output the content exactly as provided. Do not change, summarize, or add anything.",
                 model="gpt-4.1-mini",
                 model_settings=ModelSettings(temperature=0, max_tokens=4096, store=False)
             )
-            result = Runner.run_streamed(display_agent, final_input)
+            result = Runner.run_streamed(display_agent, display_input)
             async for event in stream_agent_response(agent_context, result):
                 yield event
             return
 
-        # ── Fallback ──
+        # Fallback
         result = Runner.run_streamed(get_info_agent, agent_input)
         async for event in stream_agent_response(agent_context, result):
             yield event
