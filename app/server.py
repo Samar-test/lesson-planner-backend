@@ -489,19 +489,26 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
         super().__init__(self.store)
 
     async def _load_plan(self, thread_id: str, context: dict[str, Any]) -> dict[str, Any]:
-        """Load the current lesson plan JSON from the store."""
+        """Load the current lesson plan from thread metadata."""
+        import copy
         try:
-            raw = await self.store.get(f"{thread_id}:{PLAN_KEY}", context)
-            if raw:
-                return json.loads(raw)
+            thread = await self.store.load_thread(thread_id, context)
+            if thread.metadata and "lesson_plan" in thread.metadata:
+                return thread.metadata["lesson_plan"]
         except Exception:
             pass
-        import copy
         return copy.deepcopy(EMPTY_PLAN)
 
     async def _save_plan(self, thread_id: str, plan: dict[str, Any], context: dict[str, Any]) -> None:
-        """Save the current lesson plan JSON to the store."""
-        await self.store.set(f"{thread_id}:{PLAN_KEY}", json.dumps(plan), context)
+        """Save the current lesson plan to thread metadata."""
+        try:
+            thread = await self.store.load_thread(thread_id, context)
+            updated_metadata = dict(thread.metadata or {})
+            updated_metadata["lesson_plan"] = plan
+            updated_thread = thread.model_copy(update={"metadata": updated_metadata})
+            await self.store.save_thread(updated_thread, context)
+        except Exception:
+            pass
 
     async def respond(
         self,
