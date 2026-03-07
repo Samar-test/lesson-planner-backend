@@ -629,19 +629,70 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
 
             # Run FT model only if needed
             if ft_sections:
-                ft_input = json.dumps({
-                    "domain": current_plan["domain"],
-                    "course_title": current_plan["course_title"],
-                    "topic": current_plan["topic"],
-                    "duration": current_plan["duration"],
-                    "learner_level": current_plan["learner_level"],
-                    "instruction": f"The teacher wants to change: {changed_element}. Latest request: {items[-1].content if items else ''}"
-                })
-                ft_result = await Runner.run(ft_model_agent, ft_input)
-                ft_text = str(ft_result.final_output) if ft_result.final_output else ""
-                ft_data = parse_ft_output(ft_text)
+                # For modify, use gpt-4.1 which can follow the user's specific instruction
+                # The ft model only works well for fresh generation, not targeted changes
+                modify_instructions = (
+                    f"You are a cybersecurity lesson plan expert.\n"
+                    f"The teacher wants to modify the lesson plan. Their request: '{items[-1].content if items else ''}'\n\n"
+                    f"Current lesson details:\n"
+                    f"- Domain: {current_plan['domain']}\n"
+                    f"- Course title: {current_plan['course_title']}\n"
+                    f"- Topic: {current_plan['topic']}\n"
+                    f"- Duration: {current_plan['duration']} minutes\n"
+                    f"- Learner level: {current_plan['learner_level']}\n\n"
+                    f"Current objectives: {json.dumps(current_plan['objectives'])}\n"
+                    f"Current learning theory: {current_plan['learning_theory']['name']}\n"
+                    f"Current teaching strategy: {current_plan['teaching_strategy']['name']}\n\n"
+                    f"Sections to REGENERATE: {', '.join(ft_sections)}\n"
+                    f"Sections to KEEP exactly as-is: all others\n\n"
+                    f"Respond in this exact format:\n"
+                    f"OBJECTIVES:\n1. ...\n2. ...\n3. ...\n\n"
+                    f"LEARNING_THEORY_NAME: ...\n"
+                    f"LEARNING_THEORY_JUSTIFICATION: ...\n\n"
+                    f"TEACHING_STRATEGY_NAME: ...\n"
+                    f"TEACHING_STRATEGY_JUSTIFICATION: ..."
+                )
+                modify_agent = Agent(
+                    name="Modify_agent",
+                    instructions="You are a cybersecurity lesson plan expert. Follow instructions exactly.",
+                    model="gpt-4.1",
+                    model_settings=ModelSettings(temperature=0.7, max_tokens=1024, store=False)
+                )
+                modify_result = await Runner.run(modify_agent, modify_instructions)
+                ft_text = str(modify_result.final_output) if modify_result.final_output else ""
 
-                # Surgically update only regenerated sections
+                # Reuse same parser but with the new format
+                def parse_modify_output(text: str) -> dict[str, Any]:
+                    result: dict[str, Any] = {
+                        "objectives": [],
+                        "learning_theory": {"name": "", "justification": ""},
+                        "teaching_strategy": {"name": "", "justification": ""},
+                    }
+                    obj_match = re.search(r"OBJECTIVES:\s*\n(.*?)(?=LEARNING_THEORY_NAME:|$)", text, re.DOTALL | re.IGNORECASE)
+                    if obj_match:
+                        for line in obj_match.group(1).splitlines():
+                            line = line.strip()
+                            m = re.match(r"^\d+[\.\)]\s*(.+)", line)
+                            if m:
+                                result["objectives"].append(m.group(1).strip())
+                            if len(result["objectives"]) == 3:
+                                break
+                    lt_name = re.search(r"LEARNING_THEORY_NAME:\s*(.+)", text, re.IGNORECASE)
+                    if lt_name:
+                        result["learning_theory"]["name"] = lt_name.group(1).strip()
+                    lt_just = re.search(r"LEARNING_THEORY_JUSTIFICATION:\s*(.+)", text, re.IGNORECASE)
+                    if lt_just:
+                        result["learning_theory"]["justification"] = lt_just.group(1).strip()
+                    ts_name = re.search(r"TEACHING_STRATEGY_NAME:\s*(.+)", text, re.IGNORECASE)
+                    if ts_name:
+                        result["teaching_strategy"]["name"] = ts_name.group(1).strip()
+                    ts_just = re.search(r"TEACHING_STRATEGY_JUSTIFICATION:\s*(.+)", text, re.IGNORECASE)
+                    if ts_just:
+                        result["teaching_strategy"]["justification"] = ts_just.group(1).strip()
+                    return result
+
+                ft_data = parse_modify_output(ft_text)
+
                 if "objectives" in ft_sections:
                     current_plan["objectives"] = ft_data["objectives"]
                 if "learning_theory" in ft_sections:
