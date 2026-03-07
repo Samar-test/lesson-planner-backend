@@ -143,7 +143,36 @@ Always return valid values for all string fields even if empty string.""",
 
 ft_model_agent = Agent(
     name="FT_lesson_planner",
-    instructions="""You are a cybersecurity lesson plan expert. Generate a complete lesson plan based on the conversation.""",
+    instructions="""You receive the teacher's lesson information from the previous conversation.
+
+Your task:
+1. You will receive a JSON object from the previous agent with these keys: domain, course_title, topic, duration, learner_level.
+2. Based on your fine-tuning, generate:
+- Three learning objectives (use only the verbs you train on)
+- A suitable learning theory
+- A suitable teaching strategy
+
+Final output format (exactly):
+
+### Lesson Information
+- Domain: ...
+- Course title: ...
+- Topic: ...
+- Duration: ...
+- Learner level: ...
+
+### Learning Objectives
+1. ...
+2. ...
+3. ...
+
+### Learning Theory
+- Name:
+- Justification:
+
+### Teaching Strategy
+- Name:
+- Justification:""",
     model="ft:gpt-3.5-turbo-1106:kau:lesson-plan2:CDfU4BQj",
     model_settings=ModelSettings(temperature=1, top_p=1, max_tokens=2048, store=True)
 )
@@ -237,31 +266,32 @@ def parse_ft_output(text: str) -> dict[str, Any]:
     if not text:
         return result
 
-    # Parse numbered objectives — stop when we hit a non-numbered line after collecting some
-    objectives = []
-    for line in text.splitlines():
-        line = line.strip()
-        match = re.match(r"^\d+[\.\)]\s*(.+)", line)
-        if match:
-            content = match.group(1).strip()
-            # Stop if this line looks like a section header, not an objective
-            if any(kw in content.upper() for kw in ["LEARNING_THEORY", "TEACHING_STRATEGY", "NAME=", "JUSTIFICATION"]):
+    # Objectives — only lines between ### Learning Objectives and ### Learning Theory
+    obj_match = re.search(
+        r"###\s*Learning Objectives\s*\n(.*?)(?=###\s*Learning Theory)",
+        text, re.DOTALL | re.IGNORECASE
+    )
+    if obj_match:
+        for line in obj_match.group(1).splitlines():
+            line = line.strip()
+            m = re.match(r"^\d+[\.\)]\s*(.+)", line)
+            if m:
+                result["objectives"].append(m.group(1).strip())
+            if len(result["objectives"]) == 3:
                 break
-            objectives.append(content)
-    result["objectives"] = objectives
 
-    # Parse LEARNING_THEORY block
+    # Learning Theory
     lt_match = re.search(
-        r"LEARNING[_\s]THEORY[:\s]*\n?\s*[Nn]ame[=:]\s*(.+?)\n\s*[Jj]ustification[=:]\s*(.+?)(?=\n\s*TEACHING|$)",
+        r"###\s*Learning Theory\s*\n-\s*Name:\s*(.+?)\n-\s*Justification:\s*(.+?)(?=###|$)",
         text, re.DOTALL | re.IGNORECASE
     )
     if lt_match:
         result["learning_theory"]["name"] = lt_match.group(1).strip()
         result["learning_theory"]["justification"] = lt_match.group(2).strip()
 
-    # Parse TEACHING_STRATEGY block
+    # Teaching Strategy
     ts_match = re.search(
-        r"TEACHING[_\s]STRATEGY[:\s]*\n?\s*[Nn]ame[=:]\s*(.+?)\n\s*[Jj]ustification[=:]\s*(.+?)$",
+        r"###\s*Teaching Strategy\s*\n-\s*Name:\s*(.+?)\n-\s*Justification:\s*(.+?)(?=###|$)",
         text, re.DOTALL | re.IGNORECASE
     )
     if ts_match:
@@ -269,7 +299,6 @@ def parse_ft_output(text: str) -> dict[str, Any]:
         result["teaching_strategy"]["justification"] = ts_match.group(2).strip()
 
     return result
-
 
 
 def parse_activities_output(text: str) -> dict[str, Any]:
@@ -534,7 +563,14 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
             current_plan["learner_level"] = info.learner_level
 
             # FT model: objectives, learning theory, teaching strategy
-            ft_result = await Runner.run(ft_model_agent, agent_input)
+            ft_input = json.dumps({
+                "domain": current_plan["domain"],
+                "course_title": current_plan["course_title"],
+                "topic": current_plan["topic"],
+                "duration": current_plan["duration"],
+                "learner_level": current_plan["learner_level"]
+            })
+            ft_result = await Runner.run(ft_model_agent, ft_input)
             ft_text = str(ft_result.final_output) if ft_result.final_output else ""
             ft_data = parse_ft_output(ft_text)
 
@@ -593,7 +629,14 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
 
             # Run FT model only if needed
             if ft_sections:
-                ft_result = await Runner.run(ft_model_agent, agent_input)
+                ft_input = json.dumps({
+                    "domain": current_plan["domain"],
+                    "course_title": current_plan["course_title"],
+                    "topic": current_plan["topic"],
+                    "duration": current_plan["duration"],
+                    "learner_level": current_plan["learner_level"]
+                })
+                ft_result = await Runner.run(ft_model_agent, ft_input)
                 ft_text = str(ft_result.final_output) if ft_result.final_output else ""
                 ft_data = parse_ft_output(ft_text)
 
