@@ -144,26 +144,11 @@ Always return valid values for all string fields even if empty string.""",
 ft_model_agent = Agent(
     name="FT_lesson_planner",
     instructions="""You are a cybersecurity lesson plan expert.
-Given the lesson details, generate the requested sections.
+Generate the requested lesson plan sections for the given lesson details.
 
-You will receive a message telling you EXACTLY which sections to generate and what the current lesson details are.
-
-If a section is marked as KEEP, copy it exactly from the provided current plan.
-If a section is marked as REGENERATE, create new high-quality content for it.
-Always generate exactly 3 learning objectives.
-
-Respond using EXACTLY this format (no extra text, no markdown):
-
-OBJECTIVES:
-1. <objective 1>
-2. <objective 2>
-3. <objective 3>
-
-LEARNING_THEORY_NAME: <name>
-LEARNING_THEORY_JUSTIFICATION: <justification>
-
-TEACHING_STRATEGY_NAME: <name>
-TEACHING_STRATEGY_JUSTIFICATION: <justification>""",
+If a section is marked as KEEP, copy it exactly.
+If a section is marked as REGENERATE, create new high-quality content.
+Always generate exactly 3 learning objectives.""",
     model="ft:gpt-3.5-turbo-1106:kau:lesson-plan2:CDfU4BQj",
     model_settings=ModelSettings(temperature=1, top_p=1, max_tokens=1024, store=True)
 )
@@ -248,23 +233,6 @@ If the teacher asks a general question, answer it helpfully and briefly.""",
 # ── FT Model Output Parser ────────────────────────────────────────────────
 
 def parse_ft_output(text: str) -> dict[str, Any]:
-    """
-    Parse the plain text output from the ft model into a structured dict.
-    The ft model does not support JSON schema output so we parse its
-    custom text format instead.
-
-    Expected format:
-        OBJECTIVES:
-        1. objective one
-        2. objective two
-        3. objective three
-
-        LEARNING_THEORY_NAME: name
-        LEARNING_THEORY_JUSTIFICATION: justification
-
-        TEACHING_STRATEGY_NAME: name
-        TEACHING_STRATEGY_JUSTIFICATION: justification
-    """
     result: dict[str, Any] = {
         "objectives": [],
         "learning_theory": {"name": "", "justification": ""},
@@ -274,37 +242,39 @@ def parse_ft_output(text: str) -> dict[str, Any]:
     if not text:
         return result
 
-    # Parse objectives block
-    obj_match = re.search(r"OBJECTIVES:\s*(.*?)(?=LEARNING_THEORY_NAME:|$)", text, re.DOTALL | re.IGNORECASE)
-    if obj_match:
-        obj_block = obj_match.group(1).strip()
-        objectives = []
-        for line in obj_block.splitlines():
-            line = line.strip()
-            line = re.sub(r"^\d+[\.\)]\s*", "", line)
-            if line:
-                objectives.append(line)
-        result["objectives"] = objectives
+    # Parse numbered objectives — stop when we hit a non-numbered line after collecting some
+    objectives = []
+    for line in text.splitlines():
+        line = line.strip()
+        match = re.match(r"^\d+[\.\)]\s*(.+)", line)
+        if match:
+            content = match.group(1).strip()
+            # Stop if this line looks like a section header, not an objective
+            if any(kw in content.upper() for kw in ["LEARNING_THEORY", "TEACHING_STRATEGY", "NAME=", "JUSTIFICATION"]):
+                break
+            objectives.append(content)
+    result["objectives"] = objectives
 
-    # Parse learning theory
-    lt_name = re.search(r"LEARNING_THEORY_NAME:\s*(.+)", text, re.IGNORECASE)
-    if lt_name:
-        result["learning_theory"]["name"] = lt_name.group(1).strip()
+    # Parse LEARNING_THEORY block
+    lt_match = re.search(
+        r"LEARNING[_\s]THEORY[:\s]*\n?\s*[Nn]ame[=:]\s*(.+?)\n\s*[Jj]ustification[=:]\s*(.+?)(?=\n\s*TEACHING|$)",
+        text, re.DOTALL | re.IGNORECASE
+    )
+    if lt_match:
+        result["learning_theory"]["name"] = lt_match.group(1).strip()
+        result["learning_theory"]["justification"] = lt_match.group(2).strip()
 
-    lt_just = re.search(r"LEARNING_THEORY_JUSTIFICATION:\s*(.+)", text, re.IGNORECASE)
-    if lt_just:
-        result["learning_theory"]["justification"] = lt_just.group(1).strip()
-
-    # Parse teaching strategy
-    ts_name = re.search(r"TEACHING_STRATEGY_NAME:\s*(.+)", text, re.IGNORECASE)
-    if ts_name:
-        result["teaching_strategy"]["name"] = ts_name.group(1).strip()
-
-    ts_just = re.search(r"TEACHING_STRATEGY_JUSTIFICATION:\s*(.+)", text, re.IGNORECASE)
-    if ts_just:
-        result["teaching_strategy"]["justification"] = ts_just.group(1).strip()
+    # Parse TEACHING_STRATEGY block
+    ts_match = re.search(
+        r"TEACHING[_\s]STRATEGY[:\s]*\n?\s*[Nn]ame[=:]\s*(.+?)\n\s*[Jj]ustification[=:]\s*(.+?)$",
+        text, re.DOTALL | re.IGNORECASE
+    )
+    if ts_match:
+        result["teaching_strategy"]["name"] = ts_match.group(1).strip()
+        result["teaching_strategy"]["justification"] = ts_match.group(2).strip()
 
     return result
+
 
 
 def parse_activities_output(text: str) -> dict[str, Any]:
