@@ -143,14 +143,9 @@ Always return valid values for all string fields even if empty string.""",
 
 ft_model_agent = Agent(
     name="FT_lesson_planner",
-    instructions="""You are a cybersecurity lesson plan expert.
-Generate the requested lesson plan sections for the given lesson details.
-
-If a section is marked as KEEP, copy it exactly.
-If a section is marked as REGENERATE, create new high-quality content.
-Always generate exactly 3 learning objectives.""",
+    instructions="""You are a cybersecurity lesson plan expert. Generate a complete lesson plan based on the conversation.""",
     model="ft:gpt-3.5-turbo-1106:kau:lesson-plan2:CDfU4BQj",
-    model_settings=ModelSettings(temperature=1, top_p=1, max_tokens=1024, store=True)
+    model_settings=ModelSettings(temperature=1, top_p=1, max_tokens=2048, store=True)
 )
 
 activities_generator = Agent(
@@ -539,12 +534,7 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
             current_plan["learner_level"] = info.learner_level
 
             # FT model: objectives, learning theory, teaching strategy
-            ft_prompt = build_ft_prompt(
-                current_plan,
-                sections_to_regenerate=["objectives", "learning_theory", "teaching_strategy"],
-                info=info,
-            )
-            ft_result = await Runner.run(ft_model_agent, ft_prompt)
+            ft_result = await Runner.run(ft_model_agent, agent_input)
             ft_text = str(ft_result.final_output) if ft_result.final_output else ""
             ft_data = parse_ft_output(ft_text)
 
@@ -603,8 +593,7 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
 
             # Run FT model only if needed
             if ft_sections:
-                ft_prompt = build_ft_prompt(current_plan, ft_sections, info)
-                ft_result = await Runner.run(ft_model_agent, ft_prompt)
+                ft_result = await Runner.run(ft_model_agent, agent_input)
                 ft_text = str(ft_result.final_output) if ft_result.final_output else ""
                 ft_data = parse_ft_output(ft_text)
 
