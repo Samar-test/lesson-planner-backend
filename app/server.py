@@ -19,7 +19,7 @@ web_search_preview = WebSearchTool(
     user_location={"type": "approximate"}
 )
 
-class InfoSchema(BaseModel):
+class InfoCollectorAgentSchema(BaseModel):
     has_all_details: bool
     domain: str
     course_title: str
@@ -33,48 +33,42 @@ class IntentSchema(BaseModel):
 
 info_collector_agent = Agent(
     name="Info_collector_agent",
-    instructions="""You extract lesson plan details from the conversation history.
-Extract: Domain, Course title, Topic, Duration, Learner level (Beginner / Intermediate / Advanced).
-If all five are present → has_all_details = true, fill all fields.
-If any is missing → has_all_details = false.
-Always return valid string values even if empty.""",
+    instructions="""You are an assistant that gathers the key details needed to generate a cybersecurity lesson plan.
+Look through the ENTIRE conversation history to extract the following:
+Domain, Course title, Topic, Duration, Learner level (Beginner / Intermediate / Advanced)
+If all five details are present anywhere in the conversation, return has_all_details as true with all fields filled.
+If any detail is missing, return has_all_details as false.
+Always return valid values for all string fields even if empty.""",
     model="gpt-4.1",
-    output_type=InfoSchema,
-    model_settings=ModelSettings(temperature=0, max_tokens=256, store=True)
+    output_type=InfoCollectorAgentSchema,
+    model_settings=ModelSettings(temperature=0, top_p=1, max_tokens=512, store=True)
 )
 
 intent_agent = Agent(
     name="Intent_detector",
-    instructions="""You classify the teacher's LATEST message. Read the full conversation for context.
+    instructions="""You analyze the teacher's latest message in the context of a lesson plan conversation.
 
-INTENT OPTIONS:
-- "new_lesson": Teacher provides new lesson details or wants a lesson on a new topic
-- "regenerate": Teacher is unhappy with the CURRENT lesson and wants it redone with SAME details (e.g. "not good", "try again", "give me a different one", "regenerate", "redo this")
-- "modify": Teacher wants to change ONE specific section of the current lesson plan
-- "get_info": Not enough details provided yet
-- "other": Off-topic or general question
+Classify the intent as one of:
+- "new_lesson": Teacher is providing new lesson details or starting fresh
+- "regenerate": Teacher wants a completely new version of the same lesson (e.g. "not good", "try again", "regenerate", "different one")
+- "modify": Teacher wants to change a specific part of the lesson plan
+- "get_info": Teacher hasn't provided enough details yet
+- "other": General question or unclear
 
-IMPORTANT RULES:
-- "regenerate" = same topic, completely new content
-- "modify" = keep most of the plan, change ONE part only
-- If teacher says "not good" or "different one" → ALWAYS "regenerate", never "modify"
-- If teacher says "change the [section]" → ALWAYS "modify"
-
-If intent is "modify", set changed_element to ONE of:
+If intent is "modify", also identify what changed in changed_element as one of:
 topic, learner_level, duration, objectives, learning_theory, teaching_strategy, activities, assessments
 
-Return ONLY valid JSON:
-{"intent": "regenerate", "changed_element": ""}
-{"intent": "modify", "changed_element": "objectives"}""",
+Reply with ONLY valid JSON like: {"intent": "modify", "changed_element": "objectives"}
+or {"intent": "new_lesson", "changed_element": ""}""",
     model="gpt-4.1",
     output_type=IntentSchema,
-    model_settings=ModelSettings(temperature=0, max_tokens=50, store=True)
+    model_settings=ModelSettings(temperature=0, max_tokens=100, store=True)
 )
 
-ft_full_generator = Agent(
-    name="FT_Full_Generator",
-    instructions="""You generate a cybersecurity lesson plan from the teacher's details.
-Output EXACTLY this format, nothing more, nothing less:
+lesson_plan_generator = Agent(
+    name="Lesson_plan_generator",
+    instructions="""You receive the teacher's lesson information from the conversation.
+Generate a complete lesson plan with exactly this format:
 
 ### Lesson Information
 - Domain: ...
@@ -89,79 +83,41 @@ Output EXACTLY this format, nothing more, nothing less:
 3. ...
 
 ### Learning Theory
-- Name: ...
-- Justification: ...
+- Name:
+- Justification:
 
 ### Teaching Strategy
-- Name: ...
-- Justification: ...""",
+- Name:
+- Justification:""",
     model="ft:gpt-3.5-turbo-1106:kau:lesson-plan2:CDfU4BQj",
     model_settings=ModelSettings(temperature=1, top_p=1, max_tokens=2048, store=True)
 )
 
-ft_objectives_generator = Agent(
-    name="FT_Objectives_Generator",
-    instructions="""You update ONLY the Learning Objectives section of a cybersecurity lesson plan.
-Apply the teacher's requested change to the objectives.
-Output ONLY the objectives in this exact format:
-
-### Learning Objectives
-1. ...
-2. ...
-3. ...
-
-Nothing else. No other sections.""",
-    model="ft:gpt-3.5-turbo-1106:kau:lesson-plan2:CDfU4BQj",
-    model_settings=ModelSettings(temperature=1, top_p=1, max_tokens=512, store=True)
-)
-
-ft_theory_generator = Agent(
-    name="FT_Theory_Generator",
-    instructions="""You update ONLY the Learning Theory section of a cybersecurity lesson plan.
-Apply the teacher's requested change.
-Output ONLY this section:
-
-### Learning Theory
-- Name: ...
-- Justification: ...
-
-Nothing else.""",
-    model="ft:gpt-3.5-turbo-1106:kau:lesson-plan2:CDfU4BQj",
-    model_settings=ModelSettings(temperature=1, top_p=1, max_tokens=256, store=True)
-)
-
-ft_strategy_generator = Agent(
-    name="FT_Strategy_Generator",
-    instructions="""You update ONLY the Teaching Strategy section of a cybersecurity lesson plan.
-Apply the teacher's requested change.
-Output ONLY this section:
-
-### Teaching Strategy
-- Name: ...
-- Justification: ...
-
-Nothing else.""",
-    model="ft:gpt-3.5-turbo-1106:kau:lesson-plan2:CDfU4BQj",
-    model_settings=ModelSettings(temperature=1, top_p=1, max_tokens=256, store=True)
-)
-
 activities_generator = Agent(
-    name="Activities_Generator",
-    instructions="""You generate ONLY learning activities for a cybersecurity lesson plan.
-You will receive the full lesson plan above. Use the objectives, topic, learner level, and duration.
+    name="Activities & Assessments Generator",
+    instructions="""You are an expert in cybersecurity education and instructional design.
+Create learning activities and assessments aligned strictly with:
+- Topic
+- The three Learning Objectives
+- Learner Level (Beginner / Intermediate / Advanced)
+- Total Lesson Duration
 
-TIME CALCULATION (MANDATORY - follow exactly):
-1. Lecture time = 65% of total duration (round to nearest minute)
-2. Remaining time = total duration - lecture time
-3. Activities budget = 70% of remaining time (round to nearest minute)
-4. Each activity time must sum to EXACTLY the activities budget
+Do NOT add or modify objectives. Always state which objective(s) each activity or assessment aligns with.
 
-NUMBER OF ACTIVITIES:
-- Remaining < 15 min → 2 activities
-- Remaining 15-25 min → 3 activities
-- Remaining > 25 min → 4 activities
+TIME REQUIREMENT (STRICTLY ENFORCED)
+Step 1: Calculate total duration from the lesson info.
+Step 2: Lecture time = 65% of total duration (round to nearest minute).
+Step 3: Remaining time = total duration - lecture time.
+Step 4: Activities + assessments MUST use EXACTLY the remaining time. Not more, not less.
+Step 5: Distribute remaining time: 70% for activities, 30% for assessments (round to nearest minute).
 
-OUTPUT EXACTLY THIS FORMAT:
+If remaining time is less than 15 minutes: create only 2 activities and 2 assessments.
+If remaining time is 15-25 minutes: create 3 activities and 3 assessments.
+If remaining time is more than 25 minutes: create 4 activities and 3 assessments.
+
+Each activity and assessment MUST have a time estimate. The sum of all times MUST equal the remaining time exactly.
+
+REQUIRED OUTPUT FORMAT (follow this order exactly):
 
 ### Time Allocation Calculation
 - Total Duration: X minutes
@@ -173,80 +129,116 @@ OUTPUT EXACTLY THIS FORMAT:
 ### Learning Activities
 
 1. [Title]
-- Aligned Objective(s): ...
-- Description: ...
-- Steps: ...
-- Time Required: X minutes
-
-[repeat for each activity]""",
-    model="o4-mini",
-    model_settings=ModelSettings(max_tokens=2048, store=True)
-)
-
-assessments_generator = Agent(
-    name="Assessments_Generator",
-    instructions="""You generate ONLY assessments for a cybersecurity lesson plan.
-You will receive the full lesson plan above. Use the objectives, topic, learner level, and duration.
-
-TIME CALCULATION (MANDATORY - follow exactly):
-1. Lecture time = 65% of total duration (round to nearest minute)
-2. Remaining time = total duration - lecture time
-3. Assessments budget = 30% of remaining time (round to nearest minute)
-4. Each assessment time must sum to EXACTLY the assessments budget
-5. Create exactly 3 assessments
-
-OUTPUT EXACTLY THIS FORMAT:
-
-### Assessments
-
-1. [Title]
-- Aligned Objective(s): ...
-- Format: ...
-- Description: ...
+- Aligned Objective(s): …
+- Description: …
+- Steps: …
 - Time Required: X minutes
 
 2. [Title]
-- Aligned Objective(s): ...
-- Format: ...
-- Description: ...
+- Aligned Objective(s): …
+- Description: …
+- Steps: …
 - Time Required: X minutes
 
-3. [Title]
-- Aligned Objective(s): ...
-- Format: ...
-- Description: ...
+3. [Title] (if time permits)
+- Aligned Objective(s): …
+- Description: …
+- Steps: …
+- Time Required: X minutes
+
+### Assessments
+
+1.
+- Aligned Objective(s): …
+- Format: …
+- Description: …
+- Time Required: X minutes
+
+2.
+- Aligned Objective(s): …
+- Format: …
+- Description: …
+- Time Required: X minutes
+
+3.
+- Aligned Objective(s): …
+- Format: …
+- Description: …
 - Time Required: X minutes
 
 ### Time Summary
 - Total Activity Time: X minutes
 - Total Assessment Time: X minutes
-- Grand Total: X minutes
+- Grand Total: X minutes (MUST equal remaining time)
 
+After the time summary, end with exactly:
 ---
 ✅ Lesson plan complete! You can:
 - Ask me to **regenerate** this lesson plan
 - Ask me to **modify** a specific section
 - Provide details for a **new lesson plan**""",
     model="o4-mini",
-    model_settings=ModelSettings(max_tokens=1024, store=True)
+    tools=[web_search_preview],
+    model_settings=ModelSettings(max_tokens=4096, store=True)
 )
 
 get_data_agent = Agent(
     name="Get_data",
-    instructions="""Ask only for the missing lesson plan details from:
-Domain, Course title, Topic, Duration, Learner level (Beginner / Intermediate / Advanced).
-Be concise and friendly. Do not ask for details already provided.""",
+    instructions="""Collect the missing information needed to complete a cybersecurity lesson plan.
+Look at the conversation and ask only for what's missing from:
+- Domain
+- Course title
+- Topic
+- Duration
+- Learner level (Beginner / Intermediate / Advanced)
+Be concise and friendly.""",
     model="gpt-4.1",
-    model_settings=ModelSettings(temperature=1, max_tokens=256, store=True)
+    model_settings=ModelSettings(temperature=1, top_p=1, max_tokens=512, store=True)
 )
 
 general_agent = Agent(
     name="General_assistant",
     instructions="""You are a helpful cybersecurity education assistant.
-Answer briefly and helpfully.
-If the teacher wants a lesson plan, remind them to provide: Domain, Course title, Topic, Duration, Learner level.""",
+Answer the teacher's question helpfully and briefly.
+If they seem to want a lesson plan, remind them to provide: Domain, Course title, Topic, Duration, and Learner level.""",
     model="gpt-4.1",
     model_settings=ModelSettings(temperature=1, max_tokens=512, store=True)
+)
+
+modifier_agent = Agent(
+    name="Modifier",
+    instructions="""You are a lesson plan editor. Look at the full conversation to find the current lesson plan.
+
+Apply the requested change according to these strict rules:
+
+1. If Topic changes → Regenerate: objectives, learning theory, teaching strategy, activities, assessments. Keep: lesson information structure.
+2. If Learner Level changes → Regenerate: objectives, teaching strategy, activities, assessments. Keep: learning theory, lesson information.
+3. If Duration changes → Regenerate: activities, assessments. Keep: objectives, learning theory, teaching strategy, lesson information.
+4. If Objectives change → First update the objectives as requested, then regenerate: teaching strategy, activities, assessments. Keep: learning theory, lesson information.
+5. If Learning Theory changes → Regenerate: teaching strategy, activities, assessments. Keep: objectives, lesson information.
+6. If Teaching Strategy changes → Regenerate: activities, assessments. Keep: objectives, learning theory, lesson information.
+7. If Activities change → Regenerate activities only. Keep everything else.
+8. If Assessments change → Regenerate assessments only. Keep everything else.
+
+IMPORTANT: Always output the COMPLETE updated lesson plan with ALL sections in this exact order:
+1. Lesson Information
+2. Learning Objectives
+3. Learning Theory
+4. Teaching Strategy
+5. Time Allocation Calculation
+6. Learning Activities
+7. Assessments
+8. Time Summary
+
+TIME RULES (STRICTLY ENFORCED):
+- Lecture = 65% of total duration
+- Remaining = total duration - lecture time
+- Activities budget = 70% of remaining
+- Assessments budget = 30% of remaining
+- Sum of all activity times MUST equal activities budget exactly
+- Sum of all assessment times MUST equal assessments budget exactly""",
+    model="o4-mini",
+    model_settings=ModelSettings(max_tokens=4096, store=True)
 )
 
 
@@ -261,17 +253,21 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
         item: UserMessageItem | None,
         context: dict[str, Any],
     ) -> AsyncIterator[ThreadStreamEvent]:
-
         items_page = await self.store.load_thread_items(
-            thread.id, after=None, limit=MAX_RECENT_ITEMS,
-            order="desc", context=context,
+            thread.id,
+            after=None,
+            limit=MAX_RECENT_ITEMS,
+            order="desc",
+            context=context,
         )
         items = list(reversed(items_page.data))
         agent_input = await simple_to_agent_input(items)
-        agent_context = AgentContext(thread=thread, store=self.store, request_context=context)
 
-        def append_context(base_input, text: str):
-            return base_input + [{"role": "assistant", "content": text}]
+        agent_context = AgentContext(
+            thread=thread,
+            store=self.store,
+            request_context=context,
+        )
 
         # Detect intent
         intent_result = await Runner.run(intent_agent, agent_input)
@@ -279,105 +275,40 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
         intent = intent_output.intent.strip().lower() if intent_output else "other"
         changed_element = intent_output.changed_element.strip().lower() if intent_output else ""
 
-        if intent == "other":
-            async for event in stream_agent_response(agent_context, Runner.run_streamed(general_agent, agent_input)):
+        if intent == "modify":
+            result = Runner.run_streamed(modifier_agent, agent_input)
+            async for event in stream_agent_response(agent_context, result):
                 yield event
-            return
 
-        if intent in ("new_lesson", "regenerate", "get_info"):
+        elif intent == "other":
+            result = Runner.run_streamed(general_agent, agent_input)
+            async for event in stream_agent_response(agent_context, result):
+                yield event
+
+        else:
+            # new_lesson, regenerate, get_info
             info_result = await Runner.run(info_collector_agent, agent_input)
             info = info_result.final_output
-            if not info or not info.has_all_details:
-                async for event in stream_agent_response(agent_context, Runner.run_streamed(get_data_agent, agent_input)):
-                    yield event
-                return
 
-            ft_out = str((await Runner.run(ft_full_generator, agent_input)).final_output or "")
-            async for event in stream_agent_response(agent_context, Runner.run_streamed(ft_full_generator, agent_input)):
-                yield event
-
-            act_input = append_context(agent_input, ft_out)
-            act_out = str((await Runner.run(activities_generator, act_input)).final_output or "")
-            async for event in stream_agent_response(agent_context, Runner.run_streamed(activities_generator, act_input)):
-                yield event
-
-            assess_input = append_context(act_input, act_out)
-            async for event in stream_agent_response(agent_context, Runner.run_streamed(assessments_generator, assess_input)):
-                yield event
-            return
-
-        if intent == "modify":
-
-            if changed_element in ("topic", "learner_level"):
-                ft_out = str((await Runner.run(ft_full_generator, agent_input)).final_output or "")
-                async for event in stream_agent_response(agent_context, Runner.run_streamed(ft_full_generator, agent_input)):
-                    yield event
-                act_input = append_context(agent_input, ft_out)
-                act_out = str((await Runner.run(activities_generator, act_input)).final_output or "")
-                async for event in stream_agent_response(agent_context, Runner.run_streamed(activities_generator, act_input)):
-                    yield event
-                assess_input = append_context(act_input, act_out)
-                async for event in stream_agent_response(agent_context, Runner.run_streamed(assessments_generator, assess_input)):
+            if info and info.has_all_details:
+                lesson_result = Runner.run_streamed(lesson_plan_generator, agent_input)
+                async for event in stream_agent_response(agent_context, lesson_result):
                     yield event
 
-            elif changed_element == "objectives":
-                ft_out = str((await Runner.run(ft_objectives_generator, agent_input)).final_output or "")
-                async for event in stream_agent_response(agent_context, Runner.run_streamed(ft_objectives_generator, agent_input)):
-                    yield event
-                act_input = append_context(agent_input, ft_out)
-                act_out = str((await Runner.run(activities_generator, act_input)).final_output or "")
-                async for event in stream_agent_response(agent_context, Runner.run_streamed(activities_generator, act_input)):
-                    yield event
-                assess_input = append_context(act_input, act_out)
-                async for event in stream_agent_response(agent_context, Runner.run_streamed(assessments_generator, assess_input)):
-                    yield event
+                updated_page = await self.store.load_thread_items(
+                    thread.id, after=None, limit=MAX_RECENT_ITEMS,
+                    order="desc", context=context,
+                )
+                updated_items = list(reversed(updated_page.data))
+                updated_input = await simple_to_agent_input(updated_items)
 
-            elif changed_element == "learning_theory":
-                ft_out = str((await Runner.run(ft_theory_generator, agent_input)).final_output or "")
-                async for event in stream_agent_response(agent_context, Runner.run_streamed(ft_theory_generator, agent_input)):
-                    yield event
-                strat_input = append_context(agent_input, ft_out)
-                strat_out = str((await Runner.run(ft_strategy_generator, strat_input)).final_output or "")
-                async for event in stream_agent_response(agent_context, Runner.run_streamed(ft_strategy_generator, strat_input)):
-                    yield event
-                act_input = append_context(strat_input, strat_out)
-                act_out = str((await Runner.run(activities_generator, act_input)).final_output or "")
-                async for event in stream_agent_response(agent_context, Runner.run_streamed(activities_generator, act_input)):
-                    yield event
-                assess_input = append_context(act_input, act_out)
-                async for event in stream_agent_response(agent_context, Runner.run_streamed(assessments_generator, assess_input)):
-                    yield event
-
-            elif changed_element == "teaching_strategy":
-                ft_out = str((await Runner.run(ft_strategy_generator, agent_input)).final_output or "")
-                async for event in stream_agent_response(agent_context, Runner.run_streamed(ft_strategy_generator, agent_input)):
-                    yield event
-                act_input = append_context(agent_input, ft_out)
-                act_out = str((await Runner.run(activities_generator, act_input)).final_output or "")
-                async for event in stream_agent_response(agent_context, Runner.run_streamed(activities_generator, act_input)):
-                    yield event
-                assess_input = append_context(act_input, act_out)
-                async for event in stream_agent_response(agent_context, Runner.run_streamed(assessments_generator, assess_input)):
-                    yield event
-
-            elif changed_element == "duration":
-                act_out = str((await Runner.run(activities_generator, agent_input)).final_output or "")
-                async for event in stream_agent_response(agent_context, Runner.run_streamed(activities_generator, agent_input)):
-                    yield event
-                assess_input = append_context(agent_input, act_out)
-                async for event in stream_agent_response(agent_context, Runner.run_streamed(assessments_generator, assess_input)):
-                    yield event
-
-            elif changed_element == "activities":
-                async for event in stream_agent_response(agent_context, Runner.run_streamed(activities_generator, agent_input)):
-                    yield event
-
-            elif changed_element == "assessments":
-                async for event in stream_agent_response(agent_context, Runner.run_streamed(assessments_generator, agent_input)):
+                activities_result = Runner.run_streamed(activities_generator, updated_input)
+                async for event in stream_agent_response(agent_context, activities_result):
                     yield event
 
             else:
-                async for event in stream_agent_response(agent_context, Runner.run_streamed(general_agent, agent_input)):
+                result = Runner.run_streamed(get_data_agent, agent_input)
+                async for event in stream_agent_response(agent_context, result):
                     yield event
 
 
