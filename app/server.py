@@ -378,16 +378,6 @@ async def respond(
         intent = intent_output.intent.strip().lower() if intent_output else "other"
         changed_element = intent_output.changed_element.strip().lower() if intent_output else ""
 
-        # ── Helper: run ft model and collect output text ──
-        async def run_ft_and_collect(ft_agent, input_data) -> str:
-            result = Runner.run_streamed(ft_agent, input_data)
-            collected = []
-            async for event in stream_agent_response(agent_context, result):
-                yield event
-                if hasattr(event, 'data') and hasattr(event.data, 'text'):
-                    collected.append(event.data.text)
-            return "".join(collected)
-
         # ── Helper: build input with extra context ──
         def build_input_with_context(base_input, extra_text: str):
             return base_input + [{"role": "assistant", "content": extra_text}]
