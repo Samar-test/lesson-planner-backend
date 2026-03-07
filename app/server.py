@@ -357,7 +357,7 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
         self.store: MemoryStore = MemoryStore()
         super().__init__(self.store)
 
-    async def respond(
+async def respond(
         self,
         thread: ThreadMetadata,
         item: UserMessageItem | None,
@@ -378,6 +378,20 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
         intent = intent_output.intent.strip().lower() if intent_output else "other"
         changed_element = intent_output.changed_element.strip().lower() if intent_output else ""
 
+        # ── Helper: run ft model and collect output text ──
+        async def run_ft_and_collect(ft_agent, input_data) -> str:
+            result = Runner.run_streamed(ft_agent, input_data)
+            collected = []
+            async for event in stream_agent_response(agent_context, result):
+                yield event
+                if hasattr(event, 'data') and hasattr(event.data, 'text'):
+                    collected.append(event.data.text)
+            return "".join(collected)
+
+        # ── Helper: build input with extra context ──
+        def build_input_with_context(base_input, extra_text: str):
+            return base_input + [{"role": "assistant", "content": extra_text}]
+
         # ── Step 2: Route ──
 
         if intent == "other":
@@ -396,173 +410,142 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
                     yield event
                 return
 
-            # Full generation: ft model → activities → assessments
-            lesson_result = Runner.run_streamed(ft_full_generator, agent_input)
-            async for event in stream_agent_response(agent_context, lesson_result):
+            # 1. ft model generates lesson plan
+            ft_result = await Runner.run(ft_full_generator, agent_input)
+            ft_output = ft_result.final_output or ""
+
+            # Stream ft output manually
+            result = Runner.run_streamed(ft_full_generator, agent_input)
+            async for event in stream_agent_response(agent_context, result):
                 yield event
 
-            # Reload after ft model wrote to thread
-            updated_page = await self.store.load_thread_items(
-                thread.id, after=None, limit=MAX_RECENT_ITEMS,
-                order="desc", context=context,
-            )
-            updated_input = await simple_to_agent_input(list(reversed(updated_page.data)))
+            # 2. Pass ft output directly to activities generator
+            activities_input = build_input_with_context(agent_input, ft_output)
+            act_result = await Runner.run(activities_generator, activities_input)
+            act_output = act_result.final_output or ""
 
-            activities_result = Runner.run_streamed(activities_generator, updated_input)
-            async for event in stream_agent_response(agent_context, activities_result):
+            result = Runner.run_streamed(activities_generator, activities_input)
+            async for event in stream_agent_response(agent_context, result):
                 yield event
 
-            updated_page2 = await self.store.load_thread_items(
-                thread.id, after=None, limit=MAX_RECENT_ITEMS,
-                order="desc", context=context,
-            )
-            updated_input2 = await simple_to_agent_input(list(reversed(updated_page2.data)))
-
-            assessments_result = Runner.run_streamed(assessments_generator, updated_input2)
-            async for event in stream_agent_response(agent_context, assessments_result):
+            # 3. Pass ft + activities output to assessments generator
+            assessments_input = build_input_with_context(activities_input, act_output)
+            result = Runner.run_streamed(assessments_generator, assessments_input)
+            async for event in stream_agent_response(agent_context, result):
                 yield event
             return
 
         if intent == "modify":
 
             if changed_element in ("topic", "learner_level"):
-                # Full regeneration through ft model
-                lesson_result = Runner.run_streamed(ft_full_generator, agent_input)
-                async for event in stream_agent_response(agent_context, lesson_result):
-                    yield event
-
-                updated_page = await self.store.load_thread_items(
-                    thread.id, after=None, limit=MAX_RECENT_ITEMS,
-                    order="desc", context=context,
-                )
-                updated_input = await simple_to_agent_input(list(reversed(updated_page.data)))
-                activities_result = Runner.run_streamed(activities_generator, updated_input)
-                async for event in stream_agent_response(agent_context, activities_result):
-                    yield event
-
-                updated_page2 = await self.store.load_thread_items(
-                    thread.id, after=None, limit=MAX_RECENT_ITEMS,
-                    order="desc", context=context,
-                )
-                updated_input2 = await simple_to_agent_input(list(reversed(updated_page2.data)))
-                assessments_result = Runner.run_streamed(assessments_generator, updated_input2)
-                async for event in stream_agent_response(agent_context, assessments_result):
-                    yield event
-
-            elif changed_element == "objectives":
-                # ft model updates objectives → then regenerate activities + assessments
-                obj_result = Runner.run_streamed(ft_objectives_generator, agent_input)
-                async for event in stream_agent_response(agent_context, obj_result):
-                    yield event
-
-                updated_page = await self.store.load_thread_items(
-                    thread.id, after=None, limit=MAX_RECENT_ITEMS,
-                    order="desc", context=context,
-                )
-                updated_input = await simple_to_agent_input(list(reversed(updated_page.data)))
-                activities_result = Runner.run_streamed(activities_generator, updated_input)
-                async for event in stream_agent_response(agent_context, activities_result):
-                    yield event
-
-                updated_page2 = await self.store.load_thread_items(
-                    thread.id, after=None, limit=MAX_RECENT_ITEMS,
-                    order="desc", context=context,
-                )
-                updated_input2 = await simple_to_agent_input(list(reversed(updated_page2.data)))
-                assessments_result = Runner.run_streamed(assessments_generator, updated_input2)
-                async for event in stream_agent_response(agent_context, assessments_result):
-                    yield event
-
-            elif changed_element == "learning_theory":
-                # ft model updates theory → regenerate strategy + activities + assessments
-                theory_result = Runner.run_streamed(ft_theory_generator, agent_input)
-                async for event in stream_agent_response(agent_context, theory_result):
-                    yield event
-
-                updated_page = await self.store.load_thread_items(
-                    thread.id, after=None, limit=MAX_RECENT_ITEMS,
-                    order="desc", context=context,
-                )
-                updated_input = await simple_to_agent_input(list(reversed(updated_page.data)))
-                strategy_result = Runner.run_streamed(ft_strategy_generator, updated_input)
-                async for event in stream_agent_response(agent_context, strategy_result):
-                    yield event
-
-                updated_page2 = await self.store.load_thread_items(
-                    thread.id, after=None, limit=MAX_RECENT_ITEMS,
-                    order="desc", context=context,
-                )
-                updated_input2 = await simple_to_agent_input(list(reversed(updated_page2.data)))
-                activities_result = Runner.run_streamed(activities_generator, updated_input2)
-                async for event in stream_agent_response(agent_context, activities_result):
-                    yield event
-
-                updated_page3 = await self.store.load_thread_items(
-                    thread.id, after=None, limit=MAX_RECENT_ITEMS,
-                    order="desc", context=context,
-                )
-                updated_input3 = await simple_to_agent_input(list(reversed(updated_page3.data)))
-                assessments_result = Runner.run_streamed(assessments_generator, updated_input3)
-                async for event in stream_agent_response(agent_context, assessments_result):
-                    yield event
-
-            elif changed_element == "teaching_strategy":
-                # ft model updates strategy → regenerate activities + assessments
-                strategy_result = Runner.run_streamed(ft_strategy_generator, agent_input)
-                async for event in stream_agent_response(agent_context, strategy_result):
-                    yield event
-
-                updated_page = await self.store.load_thread_items(
-                    thread.id, after=None, limit=MAX_RECENT_ITEMS,
-                    order="desc", context=context,
-                )
-                updated_input = await simple_to_agent_input(list(reversed(updated_page.data)))
-                activities_result = Runner.run_streamed(activities_generator, updated_input)
-                async for event in stream_agent_response(agent_context, activities_result):
-                    yield event
-
-                updated_page2 = await self.store.load_thread_items(
-                    thread.id, after=None, limit=MAX_RECENT_ITEMS,
-                    order="desc", context=context,
-                )
-                updated_input2 = await simple_to_agent_input(list(reversed(updated_page2.data)))
-                assessments_result = Runner.run_streamed(assessments_generator, updated_input2)
-                async for event in stream_agent_response(agent_context, assessments_result):
-                    yield event
-
-            elif changed_element == "duration":
-                # Only regenerate activities + assessments
-                activities_result = Runner.run_streamed(activities_generator, agent_input)
-                async for event in stream_agent_response(agent_context, activities_result):
-                    yield event
-
-                updated_page = await self.store.load_thread_items(
-                    thread.id, after=None, limit=MAX_RECENT_ITEMS,
-                    order="desc", context=context,
-                )
-                updated_input = await simple_to_agent_input(list(reversed(updated_page.data)))
-                assessments_result = Runner.run_streamed(assessments_generator, updated_input)
-                async for event in stream_agent_response(agent_context, assessments_result):
-                    yield event
-
-            elif changed_element == "activities":
-                # Only regenerate activities
-                activities_result = Runner.run_streamed(activities_generator, agent_input)
-                async for event in stream_agent_response(agent_context, activities_result):
-                    yield event
-
-            elif changed_element == "assessments":
-                # Only regenerate assessments
-                assessments_result = Runner.run_streamed(assessments_generator, agent_input)
-                async for event in stream_agent_response(agent_context, assessments_result):
-                    yield event
-
-            else:
-                # Fallback
-                result = Runner.run_streamed(general_agent, agent_input)
+                ft_result = await Runner.run(ft_full_generator, agent_input)
+                ft_output = ft_result.final_output or ""
+                result = Runner.run_streamed(ft_full_generator, agent_input)
                 async for event in stream_agent_response(agent_context, result):
                     yield event
 
+                activities_input = build_input_with_context(agent_input, ft_output)
+                act_result = await Runner.run(activities_generator, activities_input)
+                act_output = act_result.final_output or ""
+                result = Runner.run_streamed(activities_generator, activities_input)
+                async for event in stream_agent_response(agent_context, result):
+                    yield event
+
+                assessments_input = build_input_with_context(activities_input, act_output)
+                result = Runner.run_streamed(assessments_generator, assessments_input)
+                async for event in stream_agent_response(agent_context, result):
+                    yield event
+
+            elif changed_element == "objectives":
+                ft_result = await Runner.run(ft_objectives_generator, agent_input)
+                ft_output = ft_result.final_output or ""
+                result = Runner.run_streamed(ft_objectives_generator, agent_input)
+                async for event in stream_agent_response(agent_context, result):
+                    yield event
+
+                activities_input = build_input_with_context(agent_input, ft_output)
+                act_result = await Runner.run(activities_generator, activities_input)
+                act_output = act_result.final_output or ""
+                result = Runner.run_streamed(activities_generator, activities_input)
+                async for event in stream_agent_response(agent_context, result):
+                    yield event
+
+                assessments_input = build_input_with_context(activities_input, act_output)
+                result = Runner.run_streamed(assessments_generator, assessments_input)
+                async for event in stream_agent_response(agent_context, result):
+                    yield event
+
+            elif changed_element == "learning_theory":
+                ft_result = await Runner.run(ft_theory_generator, agent_input)
+                ft_output = ft_result.final_output or ""
+                result = Runner.run_streamed(ft_theory_generator, agent_input)
+                async for event in stream_agent_response(agent_context, result):
+                    yield event
+
+                strategy_input = build_input_with_context(agent_input, ft_output)
+                strat_result = await Runner.run(ft_strategy_generator, strategy_input)
+                strat_output = strat_result.final_output or ""
+                result = Runner.run_streamed(ft_strategy_generator, strategy_input)
+                async for event in stream_agent_response(agent_context, result):
+                    yield event
+
+                activities_input = build_input_with_context(strategy_input, strat_output)
+                act_result = await Runner.run(activities_generator, activities_input)
+                act_output = act_result.final_output or ""
+                result = Runner.run_streamed(activities_generator, activities_input)
+                async for event in stream_agent_response(agent_context, result):
+                    yield event
+
+                assessments_input = build_input_with_context(activities_input, act_output)
+                result = Runner.run_streamed(assessments_generator, assessments_input)
+                async for event in stream_agent_response(agent_context, result):
+                    yield event
+
+            elif changed_element == "teaching_strategy":
+                ft_result = await Runner.run(ft_strategy_generator, agent_input)
+                ft_output = ft_result.final_output or ""
+                result = Runner.run_streamed(ft_strategy_generator, agent_input)
+                async for event in stream_agent_response(agent_context, result):
+                    yield event
+
+                activities_input = build_input_with_context(agent_input, ft_output)
+                act_result = await Runner.run(activities_generator, activities_input)
+                act_output = act_result.final_output or ""
+                result = Runner.run_streamed(activities_generator, activities_input)
+                async for event in stream_agent_response(agent_context, result):
+                    yield event
+
+                assessments_input = build_input_with_context(activities_input, act_output)
+                result = Runner.run_streamed(assessments_generator, assessments_input)
+                async for event in stream_agent_response(agent_context, result):
+                    yield event
+
+            elif changed_element == "duration":
+                act_result = await Runner.run(activities_generator, agent_input)
+                act_output = act_result.final_output or ""
+                result = Runner.run_streamed(activities_generator, agent_input)
+                async for event in stream_agent_response(agent_context, result):
+                    yield event
+
+                assessments_input = build_input_with_context(agent_input, act_output)
+                result = Runner.run_streamed(assessments_generator, assessments_input)
+                async for event in stream_agent_response(agent_context, result):
+                    yield event
+
+            elif changed_element == "activities":
+                result = Runner.run_streamed(activities_generator, agent_input)
+                async for event in stream_agent_response(agent_context, result):
+                    yield event
+
+            elif changed_element == "assessments":
+                result = Runner.run_streamed(assessments_generator, agent_input)
+                async for event in stream_agent_response(agent_context, result):
+                    yield event
+
+            else:
+                result = Runner.run_streamed(general_agent, agent_input)
+                async for event in stream_agent_response(agent_context, result):
+                    yield event
 
 StarterChatServer = LessonPlannerServer
 
