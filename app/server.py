@@ -36,6 +36,40 @@ class IntentSchema(BaseModel):
     changed_element: str
 
 
+# ── Helper: extract only teacher requirement messages ────────────────────
+# Used during regenerate so the ft model gets clean input (no old plans).
+
+def extract_teacher_requirements(agent_input: list) -> list:
+    """
+    Filter conversation input to remove assistant messages that contain
+    lesson plan content. This ensures the ft model gets the same clean
+    input as the first generation — preventing style/format contamination.
+    """
+    filtered = []
+    for msg in agent_input:
+        role = msg.get("role", "")
+        content = str(msg.get("content", ""))
+        # Keep all user messages
+        if role == "user":
+            filtered.append(msg)
+        # Skip assistant messages that contain lesson plan sections
+        elif role == "assistant":
+            if any(marker in content for marker in [
+                "### Learning Objectives",
+                "### Lesson Information",
+                "### Time Allocation",
+                "### Learning Activities",
+                "### Assessments",
+                "### Time Summary",
+                "### Learning Theory",
+                "### Teaching Strategy",
+            ]):
+                continue
+            # Keep non-lesson-plan assistant messages
+            filtered.append(msg)
+    return filtered
+
+
 # ── Agents ───────────────────────────────────────────────────────────────
 
 info_collector_agent = Agent(
@@ -53,42 +87,62 @@ Always return valid values for all string fields even if empty.""",
 
 intent_agent = Agent(
     name="Intent_detector",
-    instructions="""You analyze the teacher's latest message in the context of a lesson plan conversation.
+    instructions="""You analyze the teacher's LATEST message (the most recent one only).
 
 Classify the intent as one of:
-- "new_lesson": Teacher is providing new lesson details or starting fresh
-- "regenerate": Teacher wants a completely new/different version of the ENTIRE lesson plan. They are unhappy with the whole thing, not a specific section.
-- "modify": Teacher wants to change a SPECIFIC part of the lesson plan (objectives, activities, assessments, etc.)
-- "get_info": Teacher hasn't provided enough details yet
-- "other": General question or unclear
+- "new_lesson": Teacher is providing NEW lesson details (different topic, domain, duration, etc.)
+- "regenerate": Teacher is unhappy with the current plan and wants a COMPLETELY NEW version.
+- "modify": Teacher wants to change a SPECIFIC NAMED section of the lesson plan.
+- "get_info": Teacher hasn't provided enough details yet.
+- "other": General question or unclear.
 
-CRITICAL DISTINCTION between regenerate vs modify:
-- "regenerate" = vague dissatisfaction with the whole plan, wants a fresh take. NO specific section mentioned.
-- "modify" = targets a specific section or element to change.
+═══════════════════════════════════════════════════════════════
+ABSOLUTE RULE FOR MODIFY vs REGENERATE:
 
-Examples of REGENERATE:
+"modify" requires the teacher to EXPLICITLY NAME a section in their latest message.
+Valid section names: topic, learner_level, duration, objectives, learning_theory, teaching_strategy, activities, assessments.
+
+If the latest message does NOT contain an explicit section name → classify as "regenerate".
+
+DO NOT look at what was discussed in previous turns to infer a section.
+DO NOT assume the teacher means the most recently changed section.
+ONLY the words in the latest message matter for this classification.
+
+If there is ANY doubt → choose "regenerate" over "modify".
+═══════════════════════════════════════════════════════════════
+
+REGENERATE examples (vague dissatisfaction, NO section named):
 - "This is not good, give me a different one" → regenerate
 - "I don't like this, try again" → regenerate
 - "Not what I wanted, start over" → regenerate
 - "Can you redo this?" → regenerate
 - "Generate another one" → regenerate
 - "This doesn't work for my class" → regenerate
+- "Give me a better one" → regenerate
+- "No, try again" → regenerate
+- "Do it again" → regenerate
+- "I need something different" → regenerate
 
-Examples of MODIFY:
+MODIFY examples (section EXPLICITLY named in the message):
 - "Change the learning objectives to focus on practical skills" → modify, objectives
 - "Make the assessments shorter" → modify, assessments
 - "Change only the assessments" → modify, assessments
 - "I want different activities" → modify, activities
-- "Update the teaching strategy to use project-based learning" → modify, teaching_strategy
+- "Give me different activities" → modify, activities
+- "Update the teaching strategy to use PBL" → modify, teaching_strategy
 - "Change the duration to 90 minutes" → modify, duration
 - "Switch the topic to cloud security" → modify, topic
 - "Change learner level to advanced" → modify, learner_level
 
-If intent is "modify", identify changed_element as one of:
+NEW_LESSON examples (entirely new lesson details):
+- "I want a lesson on phishing" → new_lesson
+- "Create a 90-minute lesson on malware for beginners" → new_lesson
+- "New lesson: Cloud Security, 45 min, advanced" → new_lesson
+
+If intent is "modify", set changed_element to one of:
 topic, learner_level, duration, objectives, learning_theory, teaching_strategy, activities, assessments
 
-Reply with ONLY valid JSON like: {"intent": "modify", "changed_element": "objectives"}
-or {"intent": "regenerate", "changed_element": ""}""",
+Reply ONLY with valid JSON.""",
     model="gpt-4.1",
     output_type=IntentSchema,
     model_settings=ModelSettings(temperature=0, max_tokens=100, store=True)
@@ -122,8 +176,7 @@ Generate a complete lesson plan with exactly this format:
     model_settings=ModelSettings(temperature=1, top_p=1, max_tokens=2048, store=True)
 )
 
-# ── This agent is used during modify to regenerate ONLY ft-model sections ──
-# It receives explicit instructions about WHAT to regenerate based on the change.
+# ── ft_modify_agent: used during modify to regenerate ft-model sections ──
 ft_modify_agent = Agent(
     name="FT_modify_generator",
     instructions="""You are a lesson plan editor using your expertise in cybersecurity education.
@@ -247,7 +300,7 @@ After the time summary, end with exactly:
     model_settings=ModelSettings(max_tokens=4096, store=True)
 )
 
-# ── Assessments-only agent: lightweight, focused ──
+# ── Assessments-only agent ──
 assessments_only_agent = Agent(
     name="Assessments_only_generator",
     instructions="""You are an expert in cybersecurity education assessment design.
@@ -317,7 +370,7 @@ After the time summary, end with exactly:
     model_settings=ModelSettings(max_tokens=4096, store=True)
 )
 
-# ── Activities-only agent: regenerates activities keeping everything else ──
+# ── Activities-only agent ──
 activities_only_agent = Agent(
     name="Activities_only_generator",
     instructions="""You are an expert in cybersecurity education and instructional design.
@@ -397,9 +450,6 @@ If they seem to want a lesson plan, remind them to provide: Domain, Course title
 
 def get_cascade(changed_element: str) -> dict:
     """Determine which agents need to run based on what changed."""
-    # ft model handles: objectives, learning_theory, teaching_strategy
-    # o4-mini handles: activities, assessments
-
     cascades = {
         "topic": {
             "needs_ft_model": True,
@@ -506,24 +556,20 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
         # ── Step 2: Route based on intent ──
 
         if intent == "modify" and changed_element:
-            # Use cascade logic to determine which agents to call
             cascade = get_cascade(changed_element)
 
             if cascade["needs_assessments_only"]:
-                # Simple case: just regenerate assessments
                 result = Runner.run_streamed(assessments_only_agent, agent_input)
                 async for event in stream_agent_response(agent_context, result):
                     yield event
 
             elif cascade["needs_activities_only"]:
-                # Simple case: just regenerate activities
                 result = Runner.run_streamed(activities_only_agent, agent_input)
                 async for event in stream_agent_response(agent_context, result):
                     yield event
 
             elif cascade["needs_ft_model"]:
-                # Complex case: ft model first (non-streamed), then stream activities+assessments
-                # Build context instruction for ft model
+                # ft model first (non-streamed), then stream activities
                 regen_list = ", ".join(cascade["ft_regenerate"])
                 ft_context_msg = (
                     f"The teacher wants to change: {changed_element}. "
@@ -531,15 +577,11 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
                     f"Keep all other sections exactly as they are in the current lesson plan. "
                     f"Output the complete Lesson Information, Learning Objectives, Learning Theory, and Teaching Strategy sections."
                 )
-
-                # Add context instruction to the input
                 ft_input = agent_input + [{"role": "user", "content": ft_context_msg}]
 
-                # Run ft model NON-STREAMED (fast, ~3-5 seconds)
                 ft_result = await Runner.run(ft_modify_agent, ft_input)
-                ft_output = ft_result.final_output if ft_result.final_output else ""
+                ft_output = str(ft_result.final_output) if ft_result.final_output else ""
 
-                # Now stream activities+assessments with ft output as context
                 activities_context_msg = (
                     f"Here is the updated lesson plan (Lesson Information, Objectives, Theory, Strategy):\n\n"
                     f"{ft_output}\n\n"
@@ -547,18 +589,16 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
                     f"sections based on the above. Follow the time rules strictly."
                 )
                 activities_input = agent_input + [
-                    {"role": "assistant", "content": str(ft_output)},
+                    {"role": "assistant", "content": ft_output},
                     {"role": "user", "content": activities_context_msg}
                 ]
 
-                # Stream the final output (activities + assessments)
                 result = Runner.run_streamed(activities_generator, activities_input)
                 async for event in stream_agent_response(agent_context, result):
                     yield event
 
             else:
-                # Duration or teaching_strategy change: no ft model needed,
-                # just regenerate activities + assessments
+                # Duration or teaching_strategy: just regenerate activities+assessments
                 duration_context_msg = (
                     f"The teacher wants to change: {changed_element}. "
                     f"Look at the current lesson plan in the conversation. "
@@ -577,17 +617,24 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
                 yield event
 
         else:
-            # new_lesson, regenerate, get_info → same flow as before
+            # ── new_lesson, regenerate, get_info ──
             info_result = await Runner.run(info_collector_agent, agent_input)
             info = info_result.final_output
 
             if info and info.has_all_details:
-                # Stream ft model output (lesson info, objectives, theory, strategy)
-                lesson_result = Runner.run_streamed(lesson_plan_generator, agent_input)
+                # ══════════════════════════════════════════════════════════
+                # FIX FOR TEST 2: Strip old lesson plans from context so
+                # the ft model gets CLEAN input, same as first generation.
+                # This prevents style/format contamination.
+                # ══════════════════════════════════════════════════════════
+                clean_input = extract_teacher_requirements(agent_input)
+
+                # Stream ft model output
+                lesson_result = Runner.run_streamed(lesson_plan_generator, clean_input)
                 async for event in stream_agent_response(agent_context, lesson_result):
                     yield event
 
-                # Reload thread to include ft model output
+                # Reload thread to get the freshly saved ft output
                 updated_page = await self.store.load_thread_items(
                     thread.id, after=None, limit=MAX_RECENT_ITEMS,
                     order="desc", context=context,
@@ -595,8 +642,20 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
                 updated_items = list(reversed(updated_page.data))
                 updated_input = await simple_to_agent_input(updated_items)
 
-                # Stream activities + assessments
-                activities_result = Runner.run_streamed(activities_generator, updated_input)
+                # ══════════════════════════════════════════════════════════
+                # FIX: Clean activities input too, then add back ONLY the
+                # latest ft output so o4-mini doesn't mix old/new plans.
+                # ══════════════════════════════════════════════════════════
+                clean_activities_input = extract_teacher_requirements(updated_input)
+                # Find and append only the newest ft model output
+                for msg in reversed(updated_input):
+                    role = msg.get("role", "")
+                    content = str(msg.get("content", ""))
+                    if role == "assistant" and "### Learning Objectives" in content:
+                        clean_activities_input.append(msg)
+                        break
+
+                activities_result = Runner.run_streamed(activities_generator, clean_activities_input)
                 async for event in stream_agent_response(agent_context, activities_result):
                     yield event
 
