@@ -656,7 +656,29 @@ class LessonPlannerServer(ChatKitServer[dict[str, Any]]):
         current_plan = await self._load_plan(thread.id, context)
 
         # Build conversation for node functions
-        conversation = [{"role": msg["role"], "content": msg["content"]} for msg in agent_input if isinstance(msg, dict)]
+        #conversation = [{"role": msg["role"], "content": msg["content"]} for msg in agent_input if isinstance(msg, dict)]
+        # Build conversation for node functions
+        conversation = []
+        for msg in agent_input:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role")
+            content = msg.get("content")
+            # content can be a string or a list of content blocks from ChatKit
+            if isinstance(content, list):
+                # Extract text from content blocks
+                text_parts = []
+                for block in content:
+                    if isinstance(block, dict):
+                        # handles input_text, text, and other block types
+                        text_parts.append(
+                            block.get("text") or
+                            block.get("input_text") or
+                            ""
+                        )
+                content = " ".join(text_parts).strip()
+            if role and content:
+                conversation.append({"role": role, "content": content})
 
         # Step 1: Orchestrator
         orch = await node_orchestrator(conversation)
